@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
+import sys
 
 from .parsers import parse_instructions
 from .encoders import Vocab
@@ -330,7 +331,9 @@ class Trainer:
         return avg_ret, win_rate
 
     def train(self, epochs=1000, test_interval=5, test_episodes=5):
-        for e in tqdm(range(1, epochs+1)):
+        #for e in tqdm(range(1, epochs+1)):
+        for e in tqdm(range(1, epochs+1), dynamic_ncols=True, 
+                      disable=not sys.stdout.isatty()):
             self.collect_rollout()
             stats = self.update()
     
@@ -339,9 +342,10 @@ class Trainer:
                 print(f"[PPO Ep {e}] pi={stats['policy_loss']:.3f} "
                       f"v={stats['value_loss']:.3f} "
                       f"H={stats['entropy']:.3f} "
-                      f"ret={stats['return_mean']:.2f}")
+                      f"ret={stats['return_mean']:.2f}", flush=True)
     
                 # ---- 测试当前 policy ----
                 test_ret, win_rate = self.evaluate(test_episodes)
-                print(f"[Eval] avg_return={test_ret:.2f}, win_rate={win_rate:.2f}")
+                print(f"[Eval] avg_return={test_ret:.2f}, win_rate={win_rate:.2f}", 
+                      flush=True)
     
