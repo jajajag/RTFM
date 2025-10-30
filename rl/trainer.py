@@ -11,6 +11,7 @@ from .encoders import Vocab
 from .agent import Agent
 from .utils import build_vocab_from_env, obs_to_text
 
+
 # ---------------- Reward 计算 ----------------
 def compute_reward(
     mode: str,
@@ -291,11 +292,10 @@ class Trainer:
     '''
 
     def evaluate(self, episodes=5):
-        """Evaluate current policy performance without gradient updates."""
         self.agent.eval()
         total_ret, total_win = 0.0, 0
     
-        for ep in range(episodes):
+        for _ in range(episodes):
             out = self.env.reset()
             obs = out[0] if isinstance(out, tuple) else out
             done = False
@@ -303,11 +303,20 @@ class Trainer:
             prev_A_goal = None
     
             while not done:
+                # —— 和训练时一致的文本预处理 ——
+                state_text = obs_to_text(obs)  # List[str], e.g. ["..."]
+                instructions = obs.get("instructions", "") or obs.get("manual", "")
+                parts = parse_instructions(instructions)
+                tips  = parts["tips"]  or ["(no tip)."]
+                goals = parts["goals"] or ["(no goal)."]
+    
                 with torch.no_grad():
-                    out = self.agent(obs, ["(no goal)."], ["(no tip)."], return_attn=True)
-                    logits, value, A_goal, A_tip, z_goal, z_t, h_s, H_g = out
+                    logits, value, A_goal, A_tip, z_goal, z_t, h_s, H_g = \
+                        self.agent(state_text, goals, tips, return_attn=True)
                     probs = torch.softmax(logits, dim=-1)
-                    action = probs.argmax(dim=-1).item()  # greedy action
+                    action = probs.argmax(dim=-1).item()  # greedy
+    
+                # —— 兼容旧 Gym / RTFM 的 step 返回 ——
                 out = self.env.step(action)
                 if len(out) == 5:
                     obs, env_r, term, trunc, _ = out
@@ -317,18 +326,18 @@ class Trainer:
                     done = done or trunc
                 else:
                     obs, env_r, done, _ = out
-                R = compute_reward(self.reward_mode, env_r, A_goal=A_goal,
-                                   prev_A_goal=prev_A_goal, h_s=h_s, H_g=H_g, lam=self.lam)
+    
+                R = compute_reward(self.reward_mode, env_r,
+                                   A_goal=A_goal, prev_A_goal=prev_A_goal,
+                                   h_s=h_s, H_g=H_g, lam=self.lam)
                 ep_ret += R.item()
                 prev_A_goal = A_goal
     
             total_ret += ep_ret
             total_win += (ep_ret > 0)
     
-        self.agent.train()  # 切回训练模式
-        avg_ret = total_ret / episodes
-        win_rate = total_win / episodes
-        return avg_ret, win_rate
+        self.agent.train()
+        return total_ret / episodes, total_win / episodes
 
     def train(self, epochs=1000, test_interval=5, test_episodes=5):
         #for e in tqdm(range(1, epochs+1)):
