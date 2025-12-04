@@ -515,7 +515,7 @@ class Trainer:
         return total_ret / episodes, total_win / episodes
 
     # --------- 训练主循环 ----------
-    def train(self, epochs=1000, test_interval=1, test_episodes=5):
+    def train(self, epochs=1000, test_interval=5, test_episodes=5):
         for e in tqdm(
             range(1, epochs + 1),
             dynamic_ncols=True,
