@@ -80,7 +80,7 @@ class LLWrapper(gym.Wrapper):
         if self.cfg.z_mode == "single":
             z = z_single(H, sel.idx)               # (1,z_dim)
         else:
-            z = z_topk(H, sel.scores, k=self.cfg.topk, pool=self.cfg.topk_pool).unsqueeze(0)
+            z = z_topk(H, sel.scores, k=self.cfg.topk, pool=self.cfg.topk_pool)
 
         obs_ll = torch.cat([h_s, z], dim=-1).squeeze(0).detach().cpu().numpy(
                 ).astype(np.float32)
