@@ -48,12 +48,13 @@ def normalize_step(out):
         return obs2, float(r), done, dict(info)
     if len(out) == 4:
         obs2, r, a3, a4 = out
-        # Heuristic: if 4th is bool -> treat as truncated
-        if isinstance(a4, bool) and isinstance(a3, (bool, np.bool_)):
-            done = bool(a3 or a4)
-            info = {}
+        # RTFM Task: (obs, r, done, win_bool)
+        # In RTFM, the 4th item is "win"/"success", NOT truncated.
+        if isinstance(a4, (bool, np.bool_)) and isinstance(a3, (bool, np.bool_)):
+            done = bool(a3)
+            info = {"win": bool(a4), "success": bool(a4)}
             return obs2, float(r), done, info
-        # else gym: info dict
+        # Gym classic: (obs, r, done, info_dict)
         done = bool(a3)
         info = a4 if isinstance(a4, dict) else {}
         return obs2, float(r), done, dict(info)
