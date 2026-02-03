@@ -1,20 +1,55 @@
 # rl/trainer.py
 from __future__ import annotations
-from typing import Dict
-import time
+from typing import Optional, List
 import torch
 import torch.nn.functional as F
 
-from .buffers import RMBuffer, SelTraj
-from .env_utils import get_n_actions
+from stable_baselines3.common.callbacks import BaseCallback
 
-def onehot(action: int, n: int, device: str):
-    a = torch.zeros(n, device=device, dtype=torch.float32)
-    a[int(action)] = 1.0
-    return a
+from .buffers import RMBuffer, SelSegment
+
+class RTFMCallback(BaseCallback):
+    """SB3 callback to:
+      - collect RMBuffer data every step
+      - periodically update reward model / selector
+      - periodically evaluate (optional, handled outside)
+    """
+    def __init__(self, trainer: "Trainer", verbose: int = 0):
+        super().__init__(verbose=verbose)
+        self.trainer = trainer
+        self._step = 0
+
+    def _on_step(self) -> bool:
+        self._step += 1
+        # training_env is VecEnv; take first env instance
+        env0 = self.training_env.envs[0]
+
+        # RM buffer: use previous state's h_s stored by wrapper and env reward as target
+        # infos is a list len=n_envs; rewards is np array
+        info = self.locals.get("infos", [{}])[0]
+        action = self.locals.get("actions", [0])[0]
+
+        try:
+            h_s = env0.last_sel["h_s"].to(self.trainer.device)  # (D,)
+            a = self.trainer.onehot(int(action), env0.n_actions, self.trainer.device)
+            r_env = float(info.get("r_env", 0.0))
+            self.trainer.rm_buffer.add(h_s, a, r_env)
+        except Exception:
+            pass
+
+        # periodically pull finished selector segments and update selector
+        if self._step % int(self.trainer.cfg.hl_update_every_steps) == 0:
+            self.trainer.update_selector_from_env(env0)
+
+        # periodically update reward model (and optionally state encoder)
+        if self._step % int(self.trainer.cfg.ll_update_every_steps) == 0:
+            self.trainer.update_reward_model(self.trainer.cfg.rm_updates_per_call)
+
+        return True
 
 class Trainer:
-    def __init__(self, cfg, ll_env, ll_model, pi_sel, reward_model, rm_buffer: RMBuffer, device: str):
+    def __init__(self, cfg, ll_env, ll_model, pi_sel, reward_model, rm_buffer: RMBuffer, device: str,
+                 state_adapter=None, instr_adapter=None):
         self.cfg = cfg
         self.env = ll_env          # wrapped env
         self.ll_model = ll_model   # SB3 PPO/SAC
@@ -22,64 +57,36 @@ class Trainer:
         self.rm = reward_model
         self.rm_buffer = rm_buffer
         self.device = device
+        self.state_adapter = state_adapter
+        self.instr_adapter = instr_adapter
 
-        self.n_actions = get_n_actions(ll_env.env)
+        # build optimizers with the requested gradient routing
+        sel_params = list(self.pi_sel.parameters())
+        if self.instr_adapter is not None:
+            sel_params += list(self.instr_adapter.parameters())
+        if getattr(self.cfg, "state_encoder_update", "both") == "both" and (self.state_adapter is not None):
+            sel_params += list(self.state_adapter.parameters())
+        self.opt_sel = torch.optim.Adam(sel_params, lr=cfg.lr_sel)
 
-        self.opt_sel = torch.optim.Adam(self.pi_sel.parameters(), lr=cfg.lr_sel)
-        self.opt_rm  = torch.optim.Adam(self.rm.parameters(), lr=cfg.lr_rm)
+        rm_params = list(self.rm.parameters())
+        # "low" updates state encoder only through reward-model supervision
+        if getattr(self.cfg, "state_encoder_update", "both") in ["low", "both"] and (self.state_adapter is not None):
+            rm_params += list(self.state_adapter.parameters())
+        self.opt_rm  = torch.optim.Adam(rm_params, lr=cfg.lr_rm)
 
-    def collect_and_fill_buffers(self, steps: int):
-        """
-        Roll out with current low-level policy (on env reward),
-        collect (h_s, a, r_env) for reward model,
-        and collect selector logp for pi_sel update signals.
-        """
-        obs = self.env.reset()
-        traj = SelTraj()
-        t0 = time.time()
-
-        for t in range(steps):
-            #if t % 200 == 0:
-            #    dt = time.time() - t0
-            #    fps = (t / dt) if dt > 0 else 0.0
-            #    print(f"[collect] t={t}/{steps} fps={fps:.1f}", flush=True)
-
-            action, _ = self.ll_model.predict(obs, deterministic=False)
-            obs2, r_env, done, info = self.env.step(action)
-
-            # reward model data
-            h_s = self.env.last_sel["h_s"].to(self.device)                 # (state_dim,)
-            a = onehot(int(action), self.n_actions, self.device)           # (A,)
-            self.rm_buffer.add(h_s, a, float(info.get("r_env", r_env)))
-
-            # reward model prediction for selector reward bookkeeping
-            with torch.no_grad():
-                logit = self.rm(h_s.unsqueeze(0), a.unsqueeze(0)).squeeze(0)
-                r_rm = torch.sigmoid(logit).item()
-
-            traj.add(
-                logp=self.env.last_sel["sel_logp_t"],
-                r_env=float(info.get("r_env", r_env)),
-                r_rm=float(r_rm),
-            )
-
-            obs = obs2
-            if done:
-                # update selector on episode end if traj-wise mode
-                self.update_selector(traj)
-                traj = SelTraj()
-                obs = self.env.reset()
-
-        # partial traj update (optional)
-        if traj.steps:
-            self.update_selector(traj)
+    @staticmethod
+    def onehot(action: int, n: int, device: str):
+        a = torch.zeros(n, device=device, dtype=torch.float32)
+        a[int(action)] = 1.0
+        return a
 
     def update_reward_model(self, iters: int):
-        """
-        Supervised fit reward model on sparse env reward.
-        """
+        """Regression fit reward model on env reward (can be non-binary)."""
         self.rm.train()
-        for _ in range(iters):
+        if self.state_adapter is not None:
+            self.state_adapter.train()
+
+        for _ in range(int(iters)):
             batch = self.rm_buffer.sample(self.cfg.rm_batch, device=self.device)
             if batch is None:
                 break
@@ -87,52 +94,58 @@ class Trainer:
             a   = batch["a"]
             r   = batch["r"]  # (B,1)
 
-            logit = self.rm(h_s, a)
-            pred = torch.sigmoid(logit)
+            pred = self.rm(h_s, a)  # (B,1), regression
+            loss = F.mse_loss(pred, r)
 
-            # BCE works well if rewards are sparse {0,1}; otherwise switch to MSE
-            loss = F.mse_loss(pred, r.clamp(0, 1))
-
-            self.opt_rm.zero_grad()
+            self.opt_rm.zero_grad(set_to_none=True)
             loss.backward()
             self.opt_rm.step()
 
-    def update_selector(self, traj: SelTraj):
-        """
-        REINFORCE-style update for pi_sel.
-        sel_reward:
-          - one_step_rm: sum_t logp_t * r_rm_t
-          - traj_env: logp_t * sum r_env
-          - traj_rm : logp_t * sum r_rm
-        NOTE: We use stored logp scalars from env wrapper; for exact gradients,
-              you'd store tensors from forward pass. This is a lightweight baseline.
-              If you want exact gradients, we can store logp tensors in wrapper.
-        """
-        if not traj.steps:
+        self.rm.eval()
+        if self.state_adapter is not None:
+            self.state_adapter.eval()
+
+    def _value(self, obs_cpu: torch.Tensor) -> float:
+        """Try to query low-level value function V(s) from SB3 (PPO)."""
+        try:
+            policy = getattr(self.ll_model, "policy", None)
+            if policy is None:
+                return 0.0
+            obs = obs_cpu.to(self.device).unsqueeze(0)
+            with torch.no_grad():
+                v = policy.predict_values(obs).squeeze().cpu().item()
+            return float(v)
+        except Exception:
+            return 0.0
+
+    def update_selector_from_env(self, env0):
+        """Consume finished T-step segments from env wrapper and run REINFORCE update."""
+        segs: List[SelSegment] = list(getattr(env0, "finished_segments", []))
+        if not segs:
             return
+        env0.finished_segments = []
 
-        mode = self.cfg.sel_reward
-        logps = torch.stack([s.logp for s in traj.steps]).to(self.device)
+        aux_type = getattr(self.cfg, "hl_aux_type", "none")
 
-        if mode == "traj_env":
-            G = sum(s.r_env for s in traj.steps)
-            R = torch.full_like(logps, float(G))
-        elif mode == "traj_rm":
-            G = sum(s.r_rm for s in traj.steps)
-            R = torch.full_like(logps, float(G))
-        else:  # one_step_rm
-            R = torch.tensor([s.r_rm for s in traj.steps], 
-                             device=self.device, dtype=torch.float32)
-        loss = -(logps * R).mean()
+        # build rewards (optionally add v_diff here because it needs ll_model)
+        Rs = []
+        logps = []
+        for seg in segs:
+            R = float(seg.R)
+            if aux_type == "v_diff" and (seg.obs_start is not None) and (seg.obs_end is not None):
+                R += float(self.cfg.hl_aux_scale) * (self._value(seg.obs_end) - self._value(seg.obs_start))
+            Rs.append(R)
+            logps.append(seg.logp)
 
-        self.opt_sel.zero_grad()
+        logps_t = torch.stack(logps).to(self.device)
+        R_t = torch.tensor(Rs, device=self.device, dtype=torch.float32)
+
+        loss = -(logps_t * R_t).mean()
+        self.opt_sel.zero_grad(set_to_none=True)
         loss.backward()
         self.opt_sel.step()
 
-    def train_low_level(self, total_timesteps: int):
-        """
-        Train SB3 low-level model. Reward comes from env wrapper's returned reward.
-        You can later change wrapper to return env/rm/mix using cfg.ll_reward.
-        """
-        self.ll_model.learn(total_timesteps=total_timesteps, reset_num_timesteps=False)
-
+    def train(self, total_timesteps: int):
+        """Train low-level with SB3, while updating reward model and selector via callbacks."""
+        cb = RTFMCallback(self, verbose=0)
+        self.ll_model.learn(total_timesteps=int(total_timesteps), reset_num_timesteps=False, callback=cb)

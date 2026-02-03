@@ -19,8 +19,21 @@ class Config:
     z_dim: int = 256
     adapter_hidden: int = 256
 
-    # pi_sel options
-    sel_reward: str = "one_step_rm"  # ["one_step_rm", "traj_env", "traj_rm"]
+    # high-level (selector) horizon
+    hl_T: int = 5                     # call pi_sel every T env steps
+    hl_gamma: float = 0.99            # discount inside each T-step segment
+    hl_update_every_steps: int = 1000 # update selector every N env steps
+
+    # high-level auxiliary reward
+    hl_aux_type: str = "none"         # ["none","v_diff","score_diff","kl_pos","kl_neg","cos"]
+    hl_aux_scale: float = 1.0         # scale for R_aux
+
+    # state encoder update mode
+    # "low": updated only by reward-model (low-level side supervision)
+    # "both": updated by reward-model and selector losses
+    state_encoder_update: str = "both"  # ["low","both"]
+
+    # z / retrieval options
     z_mode: str = "single"           # ["single", "topk"]
     topk: int = 4
     topk_pool: str = "mean"          # ["mean", "attn"]
@@ -29,11 +42,11 @@ class Config:
     ll_algo: str = "ppo"             # ["ppo", "sac"]
     ll_reward: str = "mix"           # ["env", "rm", "mix"]
     ll_lambda: float = 0.1           # lambda for mix: r_env + lambda * r_model
+    ll_update_every_steps: int = 1000  # PPO n_steps (and intended update cadence)
 
     # training schedule
-    total_iters: int = 200
-    steps_per_iter: int = 5000
-    eval_every: int = 1
+    total_steps: int = 1_000_000
+    eval_every_steps: int = 50_000
     eval_episodes: int = 50
 
     # optimization
@@ -42,7 +55,6 @@ class Config:
 
     # reward model
     rm_hidden: int = 256
-    rm_updates_per_iter: int = 200
+    rm_updates_per_call: int = 200    # gradient steps per scheduled update
     rm_batch: int = 256
     rm_buffer_capacity: int = 200000
-

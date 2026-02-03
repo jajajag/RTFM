@@ -31,14 +31,10 @@ class RMBuffer:
         return {"h_s": h, "a": a, "r": r}
 
 @dataclass
-class SelStep:
-    logp: torch.Tensor
-    r_env: float
-    r_rm: float
-
-class SelTraj:
-    def __init__(self):
-        self.steps: List[SelStep] = []
-    def add(self, logp: float, r_env: float, r_rm: float):
-        self.steps.append(SelStep(logp=logp, r_env=r_env, r_rm=r_rm))
-
+class SelSegment:
+    # REINFORCE term
+    logp: torch.Tensor           # scalar tensor with graph
+    R: float                     # scalar return for this segment (already R + R_aux)
+    # extra info for optional aux computation in trainer
+    obs_start: Optional[torch.Tensor] = None  # (obs_dim,) torch float32 on CPU
+    obs_end: Optional[torch.Tensor] = None    # (obs_dim,) torch float32 on CPU

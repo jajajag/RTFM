@@ -21,44 +21,72 @@ def make_env(level: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--level", type=str, default="rtfm:groups_nl-v0")
 
+    # env / split
+    ap.add_argument("--level", type=str, default="rtfm:groups_nl-v0")
     ap.add_argument("--split-mode", choices=["parser", "lm"], default="parser")
-    ap.add_argument("--sel-reward", choices=["one_step_rm", "traj_env", "traj_rm"], default="one_step_rm")
+    ap.add_argument("--max-instructions", type=int, default=64)
+
+    # high-level schedule + aux
+    ap.add_argument("--hl-T", type=int, default=5)
+    ap.add_argument("--hl-gamma", type=float, default=0.99)
+    ap.add_argument("--hl-update-every-steps", type=int, default=1000)
+    ap.add_argument("--hl-aux-type", choices=["none","v_diff","score_diff","kl_pos","kl_neg","cos"], default="none")
+    ap.add_argument("--hl-aux-scale", type=float, default=1.0)
+
+    # state encoder update routing
+    ap.add_argument("--state-encoder-update", choices=["low","both"], default="both")
+
+    # retrieval / z
     ap.add_argument("--z-mode", choices=["single", "topk"], default="single")
     ap.add_argument("--topk", type=int, default=4)
     ap.add_argument("--topk-pool", choices=["mean", "attn"], default="mean")
 
+    # low-level RL
     ap.add_argument("--ll-algo", choices=["ppo", "sac"], default="ppo")
     ap.add_argument("--ll-reward", choices=["env", "rm", "mix"], default="mix")
     ap.add_argument("--ll-lambda", type=float, default=0.1)
+    ap.add_argument("--ll-update-every-steps", type=int, default=1000)
 
-    ap.add_argument("--total-iters", type=int, default=200)
-    ap.add_argument("--steps-per-iter", type=int, default=5000)
-    ap.add_argument("--eval-every", type=int, default=1)
+    # training schedule
+    ap.add_argument("--total-steps", type=int, default=1_000_000)
+    ap.add_argument("--eval-every-steps", type=int, default=50_000)
     ap.add_argument("--eval-episodes", type=int, default=50)
 
+    # dims / opt
     ap.add_argument("--state-dim", type=int, default=256)
     ap.add_argument("--z-dim", type=int, default=256)
     ap.add_argument("--rm-hidden", type=int, default=256)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu")
+
     args = ap.parse_args()
 
     cfg = Config(
         level=args.level,
         split_mode=args.split_mode,
-        sel_reward=args.sel_reward,
+        max_instructions=args.max_instructions,
+
+        hl_T=args.hl_T,
+        hl_gamma=args.hl_gamma,
+        hl_update_every_steps=args.hl_update_every_steps,
+        hl_aux_type=args.hl_aux_type,
+        hl_aux_scale=args.hl_aux_scale,
+        state_encoder_update=args.state_encoder_update,
+
         z_mode=args.z_mode,
         topk=args.topk,
         topk_pool=args.topk_pool,
+
         ll_algo=args.ll_algo,
         ll_reward=args.ll_reward,
         ll_lambda=args.ll_lambda,
-        total_iters=args.total_iters,
-        steps_per_iter=args.steps_per_iter,
-        eval_every=args.eval_every,
+        ll_update_every_steps=args.ll_update_every_steps,
+
+        total_steps=args.total_steps,
+        eval_every_steps=args.eval_every_steps,
         eval_episodes=args.eval_episodes,
+
         state_dim=args.state_dim,
         z_dim=args.z_dim,
         rm_hidden=args.rm_hidden,
@@ -85,11 +113,11 @@ def main():
     state_adapter = Adapter(cfg.emb_dim, cfg.state_dim, hidden=cfg.adapter_hidden).to(cfg.device)
     instr_adapter = Adapter(cfg.emb_dim, cfg.z_dim, hidden=cfg.adapter_hidden).to(cfg.device)
 
-    # pi_sel + reward model
+    # pi_sel + reward model (regression)
     pi_sel = PiSel(d=cfg.z_dim, hidden=cfg.adapter_hidden).to(cfg.device)
     rm = RewardModel(state_dim=cfg.state_dim, action_dim=n_actions, hidden=cfg.rm_hidden).to(cfg.device)
 
-    # wrap env to produce (h_s, z_t) obs
+    # wrap env to produce (h_s, z_k) obs
     ll_env = LLWrapper(
         env=env,
         cfg=cfg,
@@ -104,29 +132,37 @@ def main():
     # SB3 low-level model
     if cfg.ll_algo == "ppo":
         from stable_baselines3 import PPO
-        ll_model = PPO("MlpPolicy", ll_env, seed=cfg.seed, verbose=0)
+        ll_model = PPO(
+            "MlpPolicy",
+            ll_env,
+            seed=cfg.seed,
+            verbose=0,
+            n_steps=int(cfg.ll_update_every_steps),
+        )
     else:
         from stable_baselines3 import SAC
         ll_model = SAC("MlpPolicy", ll_env, seed=cfg.seed, verbose=0)
 
     rm_buffer = RMBuffer(capacity=cfg.rm_buffer_capacity)
-    trainer = Trainer(cfg, ll_env, ll_model, pi_sel, rm, rm_buffer, device=cfg.device)
+    trainer = Trainer(
+        cfg, ll_env, ll_model, pi_sel, rm, rm_buffer,
+        device=cfg.device, state_adapter=state_adapter, instr_adapter=instr_adapter
+    )
 
-    for it in range(cfg.total_iters):
-        print(f"[Iter {it+1}/{cfg.total_iters}] starting...", flush=True)
-        trainer.collect_and_fill_buffers(cfg.steps_per_iter)
-        trainer.update_reward_model(cfg.rm_updates_per_iter)
-        trainer.train_low_level(cfg.steps_per_iter)
+    # train in chunks so we can evaluate
+    steps_done = 0
+    while steps_done < cfg.total_steps:
+        chunk = min(cfg.eval_every_steps, cfg.total_steps - steps_done)
+        trainer.train(chunk)
+        steps_done += chunk
 
-        if (it + 1) % cfg.eval_every == 0:
-            metrics = evaluate(ll_model, ll_env, n_episodes=cfg.eval_episodes)
-            print(
-                f"[Iter {it+1}] "
-                f"return={metrics['return_mean']:.3f}±{metrics['return_std']:.3f} "
-                f"success={metrics['success_rate']:.3f}",
-                flush=True,
-            )
+        metrics = evaluate(ll_model, ll_env, n_episodes=cfg.eval_episodes)
+        print(
+            f"[steps={steps_done}] "
+            f"return={metrics['return_mean']:.3f}±{metrics['return_std']:.3f} "
+            f"success={metrics['success_rate']:.3f}",
+            flush=True,
+        )
 
 if __name__ == "__main__":
     main()
-

@@ -5,8 +5,8 @@ import torch.nn as nn
 
 class RewardModel(nn.Module):
     """
-    Predict sparse reward from (state embedding, action one-hot).
-    Output is a logit; use sigmoid if you want probability-like shaping.
+    Regression reward model: predict a (possibly non-binary) reward signal from (state embedding, action one-hot).
+    Output is a scalar (B,1) without sigmoid.
     """
     def __init__(self, state_dim: int, action_dim: int, hidden: int = 256):
         super().__init__()
@@ -19,4 +19,3 @@ class RewardModel(nn.Module):
     def forward(self, h_s: torch.Tensor, a_onehot: torch.Tensor) -> torch.Tensor:
         x = torch.cat([h_s, a_onehot], dim=-1)
         return self.net(x)  # (B,1)
-
