@@ -65,29 +65,49 @@ def normalize_step(out):
 
 def get_instruction_paragraph(env, obs: Dict[str, Any]) -> str:
     """
-    Instructions may not be in obs for some RTFM envs.
-    Try obs first, then env.unwrapped, then env.unwrapped.task/_task.
+    Instructions may not be in obs for some RTFM envs (e.g., Progress featurizer).
+    Try obs fields, then env/task attributes, then task.get_wiki()/get_task().
     """
+    # 1) obs dict direct text fields
     if isinstance(obs, dict):
-        for k in ("instructions", "manual", "instruction", "prompt", "text"):
+        for k in ("instructions", "manual", "instruction", "prompt", "text", "wiki", "task"):
             v = obs.get(k, None)
             if isinstance(v, str) and v.strip():
                 return v
 
     U = getattr(env, "unwrapped", env)
-    for k in ("instructions", "manual", "instruction", "prompt", "text"):
+
+    # 2) env attributes
+    for k in ("instructions", "manual", "instruction", "prompt", "text", "wiki", "task"):
         v = getattr(U, k, None)
         if isinstance(v, str) and v.strip():
             return v
 
-    task = getattr(U, "task", None) or getattr(U, "_task", None)
-    if task is not None:
-        for k in ("instructions", "manual", "prompt", "text"):
-            v = getattr(task, k, None)
-            if isinstance(v, str) and v.strip():
-                return v
+    # 3) task object (attributes or methods)
+    task = getattr(U, "task", None) or getattr(U, "_task", None) or U
 
-    return ""
+    # 3a) task attributes
+    for k in ("instructions", "manual", "prompt", "text"):
+        v = getattr(task, k, None)
+        if isinstance(v, str) and v.strip():
+            return v
+
+    # 3b) IMPORTANT: RTFM stores wiki/task as methods, not fields
+    wiki = ""
+    goal = ""
+    if hasattr(task, "get_wiki") and callable(getattr(task, "get_wiki")):
+        try:
+            wiki = task.get_wiki() or ""
+        except Exception:
+            wiki = ""
+    if hasattr(task, "get_task") and callable(getattr(task, "get_task")):
+        try:
+            goal = task.get_task() or ""
+        except Exception:
+            goal = ""
+
+    paragraph = " ".join([x.strip() for x in [wiki, goal] if isinstance(x, str) and x.strip()])
+    return paragraph  # may be ""
 
 def obs_to_text(obs: Dict[str, Any]) -> str:
     """

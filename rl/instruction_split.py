@@ -1,41 +1,46 @@
 # rl/instruction_split.py
-from __future__ import annotations
-from typing import List, Dict
+from typing import List
 
-def split_with_parser(paragraph: str, max_n: int, parse_instructions_fn=None) -> List[str]:
-    """
-    Uses your (or provided) parsers.py style splitter returning {goals, tips}.
-    If parse_instructions_fn is None, fallback to naive rule split.
-    """
+def split_instructions(paragraph: str) -> List[str]:
     paragraph = (paragraph or "").strip()
     if not paragraph:
         return ["(no instruction)"]
 
-    if parse_instructions_fn is not None:
-        parts: Dict[str, List[str]] = parse_instructions_fn(paragraph)
-        goals = parts.get("goals", []) or []
-        tips  = parts.get("tips", []) or []
-        cands = goals + tips
-        if not cands:
-            cands = [paragraph]
-        return cands[:max_n]
+    sents = paragraph.split('.')
 
-    # fallback: split by lines / periods
-    seps = ["\n", ".", ";"]
-    cands = [paragraph]
-    for sep in seps:
-        tmp = []
-        for s in cands:
-            tmp.extend([x.strip() for x in s.split(sep) if x.strip()])
-        cands = tmp if tmp else cands
-    return (cands[:max_n] if cands else [paragraph])
+    ret = []
 
-def split_with_lm(paragraph: str, max_n: int) -> List[str]:
-    """
-    Placeholder interface for LLM-based splitting.
-    Keep it deterministic/stub by default (so code runs without external API).
-    You can later plug an LLM call here.
-    """
-    # For now, just reuse rule split to keep runnable.
-    return split_with_parser(paragraph, max_n, parse_instructions_fn=None)
+    for sent in sents:
+        words = sent.split()
+        if not words:
+            continue
+        first_half, second_half = '', ''
+        half, middle = [], set()
+        i = 0
+        while i < len(words):
+            if words[i] == ',':
+                if not first_half:
+                    first_half = ' '.join(half[:-1])
+                middle.add(words[i - 1])
+                middle.add(words[i + 1])
+                half = []
+            half.append(words[i])
+            i += 1
+        second_half = ' '.join(half[2:])
+        for word in middle:
+            ret.append(f'{first_half} {word} {second_half}'.strip())
+    return ret
 
+# Backward-compatible names
+def split_with_parser(paragraph: str, *_, **__) -> List[str]:
+    return split_instructions(paragraph)
+
+def split_with_lm(paragraph: str, *_, **__) -> List[str]:
+    sents = paragraph.split('.')
+    ret = [sent.strip() for sent in sents if sent]
+    return ret
+
+if __name__ == '__main__':
+    data = 'rebel enclave contains ghost , jaguar , wolf . cold monsters are defeated by grandmasters , soldiers items . you should use mysterious , shimmering items to beat poison monsters . goblin , imp , shaman are order of the forest . blessed , gleaming items are good against fire monsters . star alliance has the following members : bat , panther , zombie . use arcane , fanatical items for lightning monsters .'
+    print(split_with_parser(data))
+    print(split_with_lm(data))

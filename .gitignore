@@ -137,3 +137,4 @@ dmypy.json
 # -e packages
 /src
 /results_latest
+/results
