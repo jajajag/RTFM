@@ -58,3 +58,6 @@ class Config:
     rm_updates_per_call: int = 200    # gradient steps per scheduled update
     rm_batch: int = 256
     rm_buffer_capacity: int = 200000
+
+    # reward model input variant
+    rm_variant: str = "sa"          # ["sa","sas","sasz"]

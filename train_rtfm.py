@@ -50,13 +50,14 @@ def main():
 
     # training schedule
     ap.add_argument("--total-steps", type=int, default=1_000_000)
-    ap.add_argument("--eval-every-steps", type=int, default=50_000)
+    ap.add_argument("--eval-every-steps", type=int, default=5_000)
     ap.add_argument("--eval-episodes", type=int, default=50)
 
     # dims / opt
     ap.add_argument("--state-dim", type=int, default=256)
     ap.add_argument("--z-dim", type=int, default=256)
     ap.add_argument("--rm-hidden", type=int, default=256)
+    ap.add_argument("--rm-variant", choices=["sa","sas","sasz"], default="sa")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu")
 
@@ -90,6 +91,7 @@ def main():
         state_dim=args.state_dim,
         z_dim=args.z_dim,
         rm_hidden=args.rm_hidden,
+        rm_variant=args.rm_variant,
         seed=args.seed,
         device=args.device,
     )
@@ -115,7 +117,7 @@ def main():
 
     # pi_sel + reward model (regression)
     pi_sel = PiSel(d=cfg.z_dim, hidden=cfg.adapter_hidden).to(cfg.device)
-    rm = RewardModel(state_dim=cfg.state_dim, action_dim=n_actions, hidden=cfg.rm_hidden).to(cfg.device)
+    rm = RewardModel(state_dim=cfg.state_dim, action_dim=n_actions, hidden=cfg.rm_hidden, z_dim=cfg.z_dim, rm_variant=cfg.rm_variant, d=cfg.rm_hidden).to(cfg.device)
 
     # wrap env to produce (h_s, z_k) obs
     ll_env = LLWrapper(

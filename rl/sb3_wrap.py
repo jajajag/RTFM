@@ -238,16 +238,40 @@ class LLWrapper(gym.Wrapper):
         return obs_ll
 
     def step(self, action: int):
-        # --- compute reward model prediction r_model for (s_t, a_t) using last_sel h_s ---
+        # --- transition bookkeeping for reward-model inputs ---
         h_s_prev = self.last_sel["h_s"].to(self.cfg.device)  # (state_dim,)
+        z_prev = self.last_sel.get("z_k", None)
+        if z_prev is not None:
+            z_prev = z_prev.to(self.cfg.device)
         a_oh = onehot(int(action), self.n_actions, self.cfg.device)
 
-        with torch.no_grad():
-            r_model = float(self.rm(h_s_prev.unsqueeze(0), a_oh.unsqueeze(0)).squeeze().cpu().item())
-
-        # step env
+        # step env first (so we can use s_{t+1} for rm_variant='sas'/'sasz')
         obs2, r_env, done, info = normalize_step(self.env.step(int(action)))
         info = dict(info) if isinstance(info, dict) else {}
+
+        # encode next state (for boundary checks and for rm variants that depend on s_{t+1})
+        paragraph2 = get_instruction_paragraph(self.env, obs2)
+        cands2 = self._encode_instructions(paragraph2)
+        H2 = self._get_H(cands2)
+        h_s2 = self._encode_state(obs2)          # (1,D)
+        h_s2_sel = self._h_s_for_selector(h_s2)  # (1,D)
+        sel2 = self.pi_sel(h_s2_sel, H2, greedy=False)
+        probs2 = sel2.probs.squeeze(0).detach()
+
+        # --- compute reward-model prediction ---
+        var = getattr(self.cfg, "rm_variant", "sa")
+        with torch.no_grad():
+            if var == "sa":
+                r_model_t = self.rm(h_s_prev.unsqueeze(0), a_oh.unsqueeze(0))
+            elif var == "sas":
+                r_model_t = self.rm(h_s_prev.unsqueeze(0), a_oh.unsqueeze(0), h_s2.to(self.cfg.device))
+            elif var == "sasz":
+                if z_prev is None:
+                    z_prev = torch.zeros(self.cfg.z_dim, device=self.cfg.device)
+                r_model_t = self.rm(h_s_prev.unsqueeze(0), a_oh.unsqueeze(0), h_s2.to(self.cfg.device), z_prev.unsqueeze(0))
+            else:
+                raise ValueError(f"Unknown cfg.rm_variant={var}")
+            r_model = float(r_model_t.squeeze().cpu().item())
 
         # low-level reward
         if self.cfg.ll_reward == "rm":
@@ -261,24 +285,23 @@ class LLWrapper(gym.Wrapper):
         info["r_model"] = float(r_model)
         info["r_ll"] = float(r_ll)
 
+        # expose (s,a,s',z) for RMBuffer via callback
+        self.last_sel["h_s_prev"] = h_s_prev.detach()
+        self.last_sel["h_s_next"] = h_s2.squeeze(0).detach()
+        if z_prev is not None:
+            self.last_sel["z_k"] = z_prev.detach()
+
         # accumulate segment rewards / hs
         self._segment_rewards.append(float(r_ll))
-        # we will append h_s for next obs after encoding below (so segment has T states)
-        # build next obs (might finalize + reselection)
-        end_of_segment = bool(done) or ((self._t_in_ep + 1) % int(self.cfg.hl_T) == 0)
 
-        # encode boundary state and next probs for KL/score
-        paragraph2 = get_instruction_paragraph(self.env, obs2)
-        cands2 = self._encode_instructions(paragraph2)
-        H2 = self._get_H(cands2)
-        h_s2 = self._encode_state(obs2)
-        h_s2_sel = self._h_s_for_selector(h_s2)
-        sel2 = self.pi_sel(h_s2_sel, H2, greedy=False)
-        probs2 = sel2.probs.squeeze(0).detach()
+        end_of_segment = bool(done) or ((self._t_in_ep + 1) % int(self.cfg.hl_T) == 0)
 
         if end_of_segment:
             # store obs_end for optional v-diff
-            obs_ll_end = self._obs_ll(h_s2, self._current_z if self._current_z is not None else torch.zeros(self.cfg.z_dim, device=h_s2.device))
+            obs_ll_end = self._obs_ll(
+                h_s2,
+                self._current_z if self._current_z is not None else torch.zeros(self.cfg.z_dim, device=h_s2.device),
+            )
             self._segment_obs_end = torch.from_numpy(obs_ll_end).float()
             self._finalize_segment_with_boundary(h_s2, probs2)
 
@@ -288,6 +311,17 @@ class LLWrapper(gym.Wrapper):
                 self._segment_hs.append(h_s_new.squeeze(0))
                 self._t_in_ep += 1
                 return obs_ll, float(r_ll), bool(done), info
+
+        # not end-of-segment: keep z, just update observation with new h_s
+        if self._current_z is None:
+            self._current_z = torch.zeros(self.cfg.z_dim, device=h_s2.device)
+
+        obs_ll = self._obs_ll(h_s2, self._current_z)
+        self.last_sel["h_s"] = h_s2.squeeze(0)
+        self._segment_hs.append(h_s2.squeeze(0))
+
+        self._t_in_ep += 1
+        return obs_ll, float(r_ll), bool(done), info
 
         # not end-of-segment: keep z, just update observation with new h_s
         if self._current_z is None:

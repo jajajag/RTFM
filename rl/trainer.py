@@ -1,6 +1,6 @@
 # rl/trainer.py
 from __future__ import annotations
-from typing import Optional, List
+from typing import List
 import torch
 import torch.nn.functional as F
 
@@ -12,7 +12,6 @@ class RTFMCallback(BaseCallback):
     """SB3 callback to:
       - collect RMBuffer data every step
       - periodically update reward model / selector
-      - periodically evaluate (optional, handled outside)
     """
     def __init__(self, trainer: "Trainer", verbose: int = 0):
         super().__init__(verbose=verbose)
@@ -21,27 +20,55 @@ class RTFMCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         self._step += 1
-        # training_env is VecEnv; take first env instance
         env0 = self.training_env.envs[0]
 
-        # RM buffer: use previous state's h_s stored by wrapper and env reward as target
-        # infos is a list len=n_envs; rewards is np array
         info = self.locals.get("infos", [{}])[0]
         action = self.locals.get("actions", [0])[0]
 
+        # --- RM buffer ---
         try:
-            h_s = env0.last_sel["h_s"].to(self.trainer.device)  # (D,)
+            var = getattr(self.trainer.cfg, "rm_variant", "sa")
+
+            # Wrapper stores these per transition (set in LLWrapper.step)
+            h_s = env0.last_sel.get("h_s_prev", env0.last_sel.get("h_s", None))
+            h_sp1 = env0.last_sel.get("h_s_next", None)
+            z = env0.last_sel.get("z_k", None)
+
+            if h_s is None:
+                raise RuntimeError("LLWrapper did not provide h_s / h_s_prev in last_sel")
+
+            h_s = h_s.to(self.trainer.device)
+            if h_sp1 is not None:
+                h_sp1 = h_sp1.to(self.trainer.device)
+            if z is not None:
+                z = z.to(self.trainer.device)
+
             a = self.trainer.onehot(int(action), env0.n_actions, self.trainer.device)
             r_env = float(info.get("r_env", 0.0))
-            self.trainer.rm_buffer.add(h_s, a, r_env)
+
+            if var == "sa":
+                self.trainer.rm_buffer.add(h_s, a, r_env)
+            elif var == "sas":
+                if h_sp1 is None:
+                    raise RuntimeError("rm_variant='sas' requires h_s_next but it's missing")
+                self.trainer.rm_buffer.add(h_s, a, r_env, h_sp1=h_sp1)
+            elif var == "sasz":
+                if h_sp1 is None:
+                    raise RuntimeError("rm_variant='sasz' requires h_s_next but it's missing")
+                if z is None:
+                    # robustness: still train, but z is zero
+                    z = torch.zeros(self.trainer.cfg.z_dim, device=self.trainer.device)
+                self.trainer.rm_buffer.add(h_s, a, r_env, h_sp1=h_sp1, z=z)
+            else:
+                raise RuntimeError(f"Unknown rm_variant={var}")
         except Exception:
             pass
 
-        # periodically pull finished selector segments and update selector
+        # selector update
         if self._step % int(self.trainer.cfg.hl_update_every_steps) == 0:
             self.trainer.update_selector_from_env(env0)
 
-        # periodically update reward model (and optionally state encoder)
+        # reward-model update
         if self._step % int(self.trainer.cfg.ll_update_every_steps) == 0:
             self.trainer.update_reward_model(self.trainer.cfg.rm_updates_per_call)
 
@@ -51,8 +78,8 @@ class Trainer:
     def __init__(self, cfg, ll_env, ll_model, pi_sel, reward_model, rm_buffer: RMBuffer, device: str,
                  state_adapter=None, instr_adapter=None):
         self.cfg = cfg
-        self.env = ll_env          # wrapped env
-        self.ll_model = ll_model   # SB3 PPO/SAC
+        self.env = ll_env
+        self.ll_model = ll_model
         self.pi_sel = pi_sel
         self.rm = reward_model
         self.rm_buffer = rm_buffer
@@ -69,7 +96,6 @@ class Trainer:
         self.opt_sel = torch.optim.Adam(sel_params, lr=cfg.lr_sel)
 
         rm_params = list(self.rm.parameters())
-        # "low" updates state encoder only through reward-model supervision
         if getattr(self.cfg, "state_encoder_update", "both") in ["low", "both"] and (self.state_adapter is not None):
             rm_params += list(self.state_adapter.parameters())
         self.opt_rm  = torch.optim.Adam(rm_params, lr=cfg.lr_rm)
@@ -81,20 +107,34 @@ class Trainer:
         return a
 
     def update_reward_model(self, iters: int):
-        """Regression fit reward model on env reward (can be non-binary)."""
+        """Regression fit reward model on env reward."""
         self.rm.train()
         if self.state_adapter is not None:
             self.state_adapter.train()
+
+        var = getattr(self.cfg, "rm_variant", "sa")
 
         for _ in range(int(iters)):
             batch = self.rm_buffer.sample(self.cfg.rm_batch, device=self.device)
             if batch is None:
                 break
+
             h_s = batch["h_s"]
             a   = batch["a"]
             r   = batch["r"]  # (B,1)
 
-            pred = self.rm(h_s, a)  # (B,1), regression
+            if var == "sa":
+                pred = self.rm(h_s, a)
+            elif var == "sas":
+                pred = self.rm(h_s, a, batch["h_sp1"])
+            elif var == "sasz":
+                z = batch["z"]
+                if z is None:
+                    z = torch.zeros((h_s.shape[0], self.cfg.z_dim), device=self.device, dtype=h_s.dtype)
+                pred = self.rm(h_s, a, batch["h_sp1"], z)
+            else:
+                raise RuntimeError(f"Unknown rm_variant={var}")
+
             loss = F.mse_loss(pred, r)
 
             self.opt_rm.zero_grad(set_to_none=True)
@@ -127,7 +167,6 @@ class Trainer:
 
         aux_type = getattr(self.cfg, "hl_aux_type", "none")
 
-        # build rewards (optionally add v_diff here because it needs ll_model)
         Rs = []
         logps = []
         for seg in segs:
@@ -146,6 +185,5 @@ class Trainer:
         self.opt_sel.step()
 
     def train(self, total_timesteps: int):
-        """Train low-level with SB3, while updating reward model and selector via callbacks."""
         cb = RTFMCallback(self, verbose=0)
         self.ll_model.learn(total_timesteps=int(total_timesteps), reset_num_timesteps=False, callback=cb)
