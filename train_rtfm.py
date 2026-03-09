@@ -15,6 +15,7 @@ from rl.sb3_wrap import HRLWrapper
 from rl.selector import PiSel
 from rl.state_encoder import StateZExtractor, build_state_encoder
 
+os.makedirs("checkpoints", exist_ok=True)
 
 def _unwrap_env(env):
     """
@@ -295,6 +296,21 @@ def main():
             f"return={metrics.get('return_mean', 0.0):.3f} "
             f"success={metrics.get('success_rate', 0.0):.3f}",
             flush=True,
+        )
+        ll_model.save(f"checkpoints/ll_model_{steps_done}.zip")
+
+        torch.save(
+            {
+                "selector": selector.state_dict(),
+                "instr_adapter": instr_adapter.state_dict(),
+                "state_encoder": state_encoder.state_dict(),
+                "reward_model": reward_model.state_dict(),
+                "opt_h": trainer.opt_h.state_dict(),
+                "opt_rm": trainer.opt_rm.state_dict(),
+                "steps_done": steps_done,
+                "cfg": vars(args),
+            },
+            f"checkpoints/hrl_modules_{steps_done}.pt",
         )
 
     final_metrics = evaluate(ll_model, hrl_env, n_episodes=cfg.eval_episodes)
