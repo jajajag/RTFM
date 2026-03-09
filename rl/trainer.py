@@ -137,6 +137,10 @@ class Trainer:
         self.reward_model.eval()
 
     def update_selector(self, ll_model) -> None:
+        self.selector.train()
+        self.state_encoder.train()
+        self.instr_adapter.train()
+
         segments = self.hl_buffer.pop_all()
         if not segments:
             return
