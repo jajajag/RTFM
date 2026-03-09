@@ -1,68 +1,85 @@
-# rl/buffers.py
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import random
+
 import torch
 
+
+RawObs = Dict[str, Any]
+
+
+def _clone_obs_to_cpu(obs: RawObs) -> RawObs:
+    out: RawObs = {}
+    for k, v in obs.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.detach().cpu().clone()
+        else:
+            out[k] = v
+    return out
+
+
 @dataclass
-class RMItem:
-    h_s: torch.Tensor            # (D,)
-    a: torch.Tensor              # (A,)
-    r: float
-    h_sp1: Optional[torch.Tensor] = None  # (D,) next-state embedding (optional)
-    z: Optional[torch.Tensor] = None      # (Z,) instruction embedding (optional)
+class BLTransition:
+    obs: RawObs
+    action: int
+    reward: float
+    next_obs: RawObs
+    done: bool
+    z: torch.Tensor
 
-class RMBuffer:
+
+class BLBuffer:
     def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.data: List[RMItem] = []
+        self.capacity = int(capacity)
+        self.data: List[BLTransition] = []
 
-    def add(
-        self,
-        h_s: torch.Tensor,
-        a: torch.Tensor,
-        r: float,
-        *,
-        h_sp1: Optional[torch.Tensor] = None,
-        z: Optional[torch.Tensor] = None,
-    ):
+    def add(self, obs: RawObs, action: int, reward: float, next_obs: RawObs, done: bool, z: torch.Tensor) -> None:
         if len(self.data) >= self.capacity:
             self.data.pop(0)
         self.data.append(
-            RMItem(
-                h_s=h_s.detach().cpu(),
-                a=a.detach().cpu(),
-                r=float(r),
-                h_sp1=(h_sp1.detach().cpu() if h_sp1 is not None else None),
-                z=(z.detach().cpu() if z is not None else None),
+            BLTransition(
+                obs=_clone_obs_to_cpu(obs),
+                action=int(action),
+                reward=float(reward),
+                next_obs=_clone_obs_to_cpu(next_obs),
+                done=bool(done),
+                z=z.detach().cpu().clone(),
             )
         )
 
-    def sample(self, batch: int, device: str) -> Optional[dict]:
-        if len(self.data) < batch:
+    def sample(self, batch_size: int) -> Optional[List[BLTransition]]:
+        if len(self.data) < batch_size:
             return None
-        items = random.sample(self.data, batch)
+        return random.sample(self.data, batch_size)
 
-        h = torch.stack([it.h_s for it in items]).to(device)
-        a = torch.stack([it.a for it in items]).to(device)
-        r = torch.tensor([it.r for it in items], dtype=torch.float32, device=device).unsqueeze(-1)
+    def __len__(self) -> int:
+        return len(self.data)
 
-        h_sp1 = None
-        if items[0].h_sp1 is not None:
-            h_sp1 = torch.stack([it.h_sp1 for it in items]).to(device)
-
-        z = None
-        if items[0].z is not None:
-            z = torch.stack([it.z for it in items]).to(device)
-
-        return {"h_s": h, "a": a, "r": r, "h_sp1": h_sp1, "z": z}
 
 @dataclass
-class SelSegment:
-    # REINFORCE term
-    logp: torch.Tensor           # scalar tensor with graph
-    R: float                     # scalar return for this segment (already R + R_aux)
-    # extra info for optional aux computation in trainer
-    obs_start: Optional[torch.Tensor] = None  # (obs_dim,) torch float32 on CPU
-    obs_end: Optional[torch.Tensor] = None    # (obs_dim,) torch float32 on CPU
+class HLSegment:
+    episode_id: int
+    seg_idx: int
+    obs_start: RawObs
+    obs_end: RawObs
+    action_idx: int
+    logp: torch.Tensor
+    z: torch.Tensor
+    base_return: float
+    aux_reward: float
+    done: bool
+
+
+class HLBuffer:
+    def __init__(self):
+        self.data: List[HLSegment] = []
+
+    def add(self, seg: HLSegment) -> None:
+        self.data.append(seg)
+
+    def pop_all(self) -> List[HLSegment]:
+        data = self.data
+        self.data = []
+        return data

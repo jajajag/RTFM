@@ -1,63 +1,65 @@
-# rl/config.py
 from dataclasses import dataclass
+
 
 @dataclass
 class Config:
-    # env
     level: str = "rtfm:groups_nl-v0"
     seed: int = 0
-    device: str = "cuda"
+    device: str = "cpu"
 
-    # instruction split
-    split_mode: str = "parser"   # ["parser", "lm"]
+    # Environment / observations
+    room_shape: int = 6
+    partially_observable: bool = False
+    max_placement: int = 1
+    shuffle_wiki: bool = False
+    time_penalty: float = 0.0
+
+    # Instruction processing
+    split_mode: str = "parser"
     max_instructions: int = 64
-
-    # frozen MiniLM + adapters
     minilm_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     emb_dim: int = 384
+    instr_dim: int = 256
     state_dim: int = 256
-    z_dim: int = 256
     adapter_hidden: int = 256
 
-    # high-level (selector) horizon
-    hl_T: int = 5                     # call pi_sel every T env steps
-    hl_gamma: float = 0.99            # discount inside each T-step segment
-    hl_update_every_steps: int = 1000 # update selector every N env steps
+    # State encoder
+    state_encoder_type: str = "txt2pi"  # mlp | conv | film | txt2pi
+    token_emb_dim: int = 64
+    text_rnn_dim: int = 64
+    state_hidden: int = 128
 
-    # high-level auxiliary reward
-    hl_aux_type: str = "none"         # ["none","v_diff","score_diff","kl_pos","kl_neg","cos"]
-    hl_aux_scale: float = 1.0         # scale for R_aux
+    # High-level selector
+    hl_T: int = 5
+    hl_gamma: float = 0.99
+    hl_lr: float = 3e-4
+    hl_update_every_steps: int = 1000
+    selector_mode: str = "sample"  # hard | sample
+    hl_return_source: str = "rm"   # rm | env
+    hl_aux_type: str = "cos"       # none | cos | v_diff
+    hl_aux_lambda: float = 1.0
 
-    # state encoder update mode
-    # "low": updated only by reward-model (low-level side supervision)
-    # "both": updated by reward-model and selector losses
-    state_encoder_update: str = "both"  # ["low","both"]
+    # Low-level policy / shaping
+    ll_algo: str = "ppo"
+    ll_lr: float = 3e-4
+    ll_gamma: float = 0.99
+    ll_reward: str = "mix"  # env | rm | mix
+    ll_lambda: float = 0.1
+    ll_update_every_steps: int = 1024
 
-    # z / retrieval options
-    z_mode: str = "single"           # ["single", "topk"]
-    topk: int = 4
-    topk_pool: str = "mean"          # ["mean", "attn"]
+    # Shared state encoder trade-offs
+    xi_H: float = 1.0
+    xi_L: float = 1.0
 
-    # low-level RL options
-    ll_algo: str = "ppo"             # ["ppo", "sac"]
-    ll_reward: str = "mix"           # ["env", "rm", "mix"]
-    ll_lambda: float = 0.1           # lambda for mix: r_env + lambda * r_model
-    ll_update_every_steps: int = 1000  # PPO n_steps (and intended update cadence)
-
-    # training schedule
-    total_steps: int = 1_000_000
-    eval_every_steps: int = 50_000
-    eval_episodes: int = 50
-
-    # optimization
-    lr_sel: float = 3e-4
-    lr_rm: float = 3e-4
-
-    # reward model
+    # Reward model
+    rm_variant: str = "sas"  # sa | sas | sasz
     rm_hidden: int = 256
-    rm_updates_per_call: int = 200    # gradient steps per scheduled update
-    rm_batch: int = 256
+    rm_lr: float = 3e-4
+    rm_batch_size: int = 256
     rm_buffer_capacity: int = 200000
+    rm_updates_per_call: int = 100
 
-    # reward model input variant
-    rm_variant: str = "sa"          # ["sa","sas","sasz"]
+    # Training / eval
+    total_steps: int = 200000
+    eval_every_steps: int = 10000
+    eval_episodes: int = 20

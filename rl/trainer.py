@@ -1,189 +1,198 @@
-# rl/trainer.py
 from __future__ import annotations
-from typing import List
+
+from collections import defaultdict
+from typing import Dict, List
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-
 from stable_baselines3.common.callbacks import BaseCallback
 
-from .buffers import RMBuffer, SelSegment
+from rl.buffers import BLBuffer, HLBuffer, HLSegment
 
-class RTFMCallback(BaseCallback):
-    """SB3 callback to:
-      - collect RMBuffer data every step
-      - periodically update reward model / selector
-    """
-    def __init__(self, trainer: "Trainer", verbose: int = 0):
-        super().__init__(verbose=verbose)
+
+class HRLCallback(BaseCallback):
+    def __init__(self, trainer, verbose: int = 0):
+        super().__init__(verbose)
         self.trainer = trainer
-        self._step = 0
+        self.step_count = 0
+
+    def _unwrap(self):
+        env = self.training_env.envs[0]
+
+        # Walk through wrappers until we find the custom HRL wrapper
+        while env is not None:
+            if hasattr(env, "pending_bl") and hasattr(env, "pending_hl"):
+                return env
+            if hasattr(env, "env"):
+                env = env.env
+            else:
+                break
+
+        raise RuntimeError(f"Could not locate HRLWrapper in env chain, got type={type(env)}")
 
     def _on_step(self) -> bool:
-        self._step += 1
-        env0 = self.training_env.envs[0]
+        env = self._unwrap()
 
-        info = self.locals.get("infos", [{}])[0]
-        action = self.locals.get("actions", [0])[0]
+        for item in env.pending_bl:
+            self.trainer.bl_buffer.add(**item)
+        env.pending_bl.clear()
 
-        # --- RM buffer ---
-        try:
-            var = getattr(self.trainer.cfg, "rm_variant", "sa")
+        for seg in env.pending_hl:
+            self.trainer.hl_buffer.add(seg)
+        env.pending_hl.clear()
 
-            # Wrapper stores these per transition (set in LLWrapper.step)
-            h_s = env0.last_sel.get("h_s_prev", env0.last_sel.get("h_s", None))
-            h_sp1 = env0.last_sel.get("h_s_next", None)
-            z = env0.last_sel.get("z_k", None)
+        self.step_count += 1
 
-            if h_s is None:
-                raise RuntimeError("LLWrapper did not provide h_s / h_s_prev in last_sel")
+        if self.step_count % int(self.trainer.cfg.hl_update_every_steps) == 0:
+            self.trainer.update_selector(self.trainer.ll_model)
 
-            h_s = h_s.to(self.trainer.device)
-            if h_sp1 is not None:
-                h_sp1 = h_sp1.to(self.trainer.device)
-            if z is not None:
-                z = z.to(self.trainer.device)
-
-            a = self.trainer.onehot(int(action), env0.n_actions, self.trainer.device)
-            r_env = float(info.get("r_env", 0.0))
-
-            if var == "sa":
-                self.trainer.rm_buffer.add(h_s, a, r_env)
-            elif var == "sas":
-                if h_sp1 is None:
-                    raise RuntimeError("rm_variant='sas' requires h_s_next but it's missing")
-                self.trainer.rm_buffer.add(h_s, a, r_env, h_sp1=h_sp1)
-            elif var == "sasz":
-                if h_sp1 is None:
-                    raise RuntimeError("rm_variant='sasz' requires h_s_next but it's missing")
-                if z is None:
-                    # robustness: still train, but z is zero
-                    z = torch.zeros(self.trainer.cfg.z_dim, device=self.trainer.device)
-                self.trainer.rm_buffer.add(h_s, a, r_env, h_sp1=h_sp1, z=z)
-            else:
-                raise RuntimeError(f"Unknown rm_variant={var}")
-        except Exception:
-            pass
-
-        # selector update
-        if self._step % int(self.trainer.cfg.hl_update_every_steps) == 0:
-            self.trainer.update_selector_from_env(env0)
-
-        # reward-model update
-        if self._step % int(self.trainer.cfg.ll_update_every_steps) == 0:
-            self.trainer.update_reward_model(self.trainer.cfg.rm_updates_per_call)
+        if self.step_count % int(self.trainer.cfg.hl_update_every_steps) == 0:
+            self.trainer.update_reward_model()
 
         return True
 
+
 class Trainer:
-    def __init__(self, cfg, ll_env, ll_model, pi_sel, reward_model, rm_buffer: RMBuffer, device: str,
-                 state_adapter=None, instr_adapter=None):
+    def __init__(self, cfg, ll_model, selector, state_encoder, instr_adapter, reward_model, bl_buffer: BLBuffer, hl_buffer: HLBuffer, minilm):
         self.cfg = cfg
-        self.env = ll_env
         self.ll_model = ll_model
-        self.pi_sel = pi_sel
-        self.rm = reward_model
-        self.rm_buffer = rm_buffer
-        self.device = device
-        self.state_adapter = state_adapter
+        self.selector = selector
+        self.state_encoder = state_encoder
         self.instr_adapter = instr_adapter
+        self.reward_model = reward_model
+        self.bl_buffer = bl_buffer
+        self.hl_buffer = hl_buffer
+        self.minilm = minilm
+        params = list(self.selector.parameters()) + list(self.instr_adapter.parameters()) + list(self.state_encoder.parameters())
+        self.opt_h = torch.optim.Adam(params, lr=cfg.hl_lr)
+        self.opt_rm = torch.optim.Adam(self.reward_model.parameters(), lr=cfg.rm_lr)
+        self.device = cfg.device
 
-        # build optimizers with the requested gradient routing
-        sel_params = list(self.pi_sel.parameters())
-        if self.instr_adapter is not None:
-            sel_params += list(self.instr_adapter.parameters())
-        if getattr(self.cfg, "state_encoder_update", "both") == "both" and (self.state_adapter is not None):
-            sel_params += list(self.state_adapter.parameters())
-        self.opt_sel = torch.optim.Adam(sel_params, lr=cfg.lr_sel)
+    def _obs_to_device(self, obs: Dict) -> Dict[str, torch.Tensor]:
+        out = {}
+        for k, v in obs.items():
+            if k == "z":
+                continue
+            if isinstance(v, torch.Tensor):
+                t = v.to(self.device)
+            else:
+                t = torch.as_tensor(v, device=self.device)
+            if t.dtype == torch.float64:
+                t = t.float()
+            if t.dim() == len(t.shape):
+                out[k] = t.unsqueeze(0)
+            else:
+                out[k] = t
+        return out
 
-        rm_params = list(self.rm.parameters())
-        if getattr(self.cfg, "state_encoder_update", "both") in ["low", "both"] and (self.state_adapter is not None):
-            rm_params += list(self.state_adapter.parameters())
-        self.opt_rm  = torch.optim.Adam(rm_params, lr=cfg.lr_rm)
+    def _encode_state(self, obs: Dict, grad: bool = True) -> torch.Tensor:
+        fn = self.state_encoder if grad else torch.no_grad()
+        if grad:
+            return self.state_encoder(self._obs_to_device(obs))
+        with torch.no_grad():
+            return self.state_encoder(self._obs_to_device(obs))
 
-    @staticmethod
-    def onehot(action: int, n: int, device: str):
-        a = torch.zeros(n, device=device, dtype=torch.float32)
-        a[int(action)] = 1.0
-        return a
+    def _value_of_obs(self, ll_model, obs: Dict) -> float:
+        wrapped = {k: (v if k == "z" else np.asarray(v)) for k, v in obs.items()}
+        wrapped_t = ll_model.policy.obs_to_tensor(wrapped)[0]
+        with torch.no_grad():
+            v = ll_model.policy.predict_values(wrapped_t)
+        return float(v.squeeze().cpu().item())
 
-    def update_reward_model(self, iters: int):
-        """Regression fit reward model on env reward."""
-        self.rm.train()
-        if self.state_adapter is not None:
-            self.state_adapter.train()
-
-        var = getattr(self.cfg, "rm_variant", "sa")
-
-        for _ in range(int(iters)):
-            batch = self.rm_buffer.sample(self.cfg.rm_batch, device=self.device)
+    def update_reward_model(self) -> None:
+        if len(self.bl_buffer) < self.cfg.rm_batch_size:
+            return
+        self.reward_model.train()
+        for _ in range(int(self.cfg.rm_updates_per_call)):
+            batch = self.bl_buffer.sample(self.cfg.rm_batch_size)
             if batch is None:
                 break
-
-            h_s = batch["h_s"]
-            a   = batch["a"]
-            r   = batch["r"]  # (B,1)
-
-            if var == "sa":
-                pred = self.rm(h_s, a)
-            elif var == "sas":
-                pred = self.rm(h_s, a, batch["h_sp1"])
-            elif var == "sasz":
-                z = batch["z"]
-                if z is None:
-                    z = torch.zeros((h_s.shape[0], self.cfg.z_dim), device=self.device, dtype=h_s.dtype)
-                pred = self.rm(h_s, a, batch["h_sp1"], z)
-            else:
-                raise RuntimeError(f"Unknown rm_variant={var}")
-
-            loss = F.mse_loss(pred, r)
-
+            hs_list = []
+            hsp1_list = []
+            a_list = []
+            r_list = []
+            z_list = []
+            for item in batch:
+                hs_list.append(self._encode_state(item.obs, grad=False).squeeze(0))
+                hsp1_list.append(self._encode_state(item.next_obs, grad=False).squeeze(0))
+                a_list.append(item.action)
+                r_list.append(item.reward)
+                z_list.append(item.z.to(self.device))
+            h_s = torch.stack(hs_list, dim=0)
+            h_sp1 = torch.stack(hsp1_list, dim=0)
+            a = torch.tensor(a_list, device=self.device)
+            z = torch.stack(z_list, dim=0)
+            pred = self.reward_model.predict_reward(
+                h_s,
+                a,
+                h_sp1=h_sp1 if self.cfg.rm_variant in {"sas", "sasz"} else None,
+                z=z if self.cfg.rm_variant == "sasz" else None,
+            )
+            target = torch.tensor(r_list, device=self.device, dtype=torch.float32)
+            loss = F.mse_loss(pred, target)
             self.opt_rm.zero_grad(set_to_none=True)
             loss.backward()
             self.opt_rm.step()
+        self.reward_model.eval()
 
-        self.rm.eval()
-        if self.state_adapter is not None:
-            self.state_adapter.eval()
-
-    def _value(self, obs_cpu: torch.Tensor) -> float:
-        """Try to query low-level value function V(s) from SB3 (PPO)."""
-        try:
-            policy = getattr(self.ll_model, "policy", None)
-            if policy is None:
-                return 0.0
-            obs = obs_cpu.to(self.device).unsqueeze(0)
-            with torch.no_grad():
-                v = policy.predict_values(obs).squeeze().cpu().item()
-            return float(v)
-        except Exception:
-            return 0.0
-
-    def update_selector_from_env(self, env0):
-        """Consume finished T-step segments from env wrapper and run REINFORCE update."""
-        segs: List[SelSegment] = list(getattr(env0, "finished_segments", []))
-        if not segs:
+    def update_selector(self, ll_model) -> None:
+        segments = self.hl_buffer.pop_all()
+        if not segments:
             return
-        env0.finished_segments = []
 
-        aux_type = getattr(self.cfg, "hl_aux_type", "none")
+        by_episode: Dict[int, List[HLSegment]] = defaultdict(list)
+        for seg in segments:
+            by_episode[seg.episode_id].append(seg)
 
-        Rs = []
-        logps = []
-        for seg in segs:
-            R = float(seg.R)
-            if aux_type == "v_diff" and (seg.obs_start is not None) and (seg.obs_end is not None):
-                R += float(self.cfg.hl_aux_scale) * (self._value(seg.obs_end) - self._value(seg.obs_start))
-            Rs.append(R)
-            logps.append(seg.logp)
+        losses = []
+        for _, ep_segments in by_episode.items():
+            ep_segments.sort(key=lambda x: x.seg_idx)
+            total_terms = []
+            running = 0.0
+            returns = [0.0] * len(ep_segments)
+            seg_rewards = []
+            for seg in ep_segments:
+                aux = float(seg.aux_reward)
+                if self.cfg.hl_aux_type == "v_diff":
+                    start_obs = dict(seg.obs_start)
+                    end_obs = dict(seg.obs_end)
+                    start_obs["z"] = seg.z.numpy().astype(np.float32)
+                    end_obs["z"] = seg.z.numpy().astype(np.float32)
+                    aux = self._value_of_obs(ll_model, end_obs) - self._value_of_obs(ll_model, start_obs)
+                seg_rewards.append(float(seg.base_return) + float(self.cfg.hl_aux_lambda) * aux)
+            for i in reversed(range(len(ep_segments))):
+                running = seg_rewards[i] + float(self.cfg.hl_gamma) * running
+                returns[i] = running
 
-        logps_t = torch.stack(logps).to(self.device)
-        R_t = torch.tensor(Rs, device=self.device, dtype=torch.float32)
+            for seg, ret in zip(ep_segments, returns):
+                h_s = self._encode_state(seg.obs_start, grad=True)
+                z = seg.z.to(self.device).unsqueeze(0)
+                tips = self.minilm.encode([seg.obs_start.get("_tip_text", "")]) if False else None
+                # Recompute instruction embeddings from the current episode text.
+                # The wrapper stores only the selected index, so we rebuild the candidate set from obs_start.
+                from rl.env_utils import get_instruction_paragraph
+                from rl.instruction_split import split_with_lm, split_with_parser
+                paragraph = get_instruction_paragraph(None, seg.obs_start)
+                if self.cfg.split_mode == "lm":
+                    instructions = split_with_lm(paragraph)
+                else:
+                    instructions = split_with_parser(paragraph)
+                instructions = [s for s in instructions if s.strip()][: self.cfg.max_instructions] or ["(no instruction)"]
+                H = self.instr_adapter(self.minilm.encode(instructions)).unsqueeze(0)
+                out = self.selector(h_s, H, mode=self.cfg.selector_mode)
+                chosen_logp = out.logp.squeeze(0)
+                total_terms.append(-chosen_logp * float(ret))
+            if total_terms:
+                losses.append(torch.stack(total_terms).mean())
 
-        loss = -(logps_t * R_t).mean()
-        self.opt_sel.zero_grad(set_to_none=True)
+        if not losses:
+            return
+        loss = self.cfg.xi_H * torch.stack(losses).mean()
+        self.opt_h.zero_grad(set_to_none=True)
         loss.backward()
-        self.opt_sel.step()
+        self.opt_h.step()
 
     def train(self, total_timesteps: int):
-        cb = RTFMCallback(self, verbose=0)
+        cb = HRLCallback(self, verbose=0)
         self.ll_model.learn(total_timesteps=int(total_timesteps), reset_num_timesteps=False, callback=cb)

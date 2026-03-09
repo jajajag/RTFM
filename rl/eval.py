@@ -1,29 +1,28 @@
-# rl/eval.py
 from __future__ import annotations
+
+from typing import Dict
+
 import numpy as np
 
-def evaluate(ll_model, env, n_episodes: int = 50):
-    rets = []
-    succ = []
-    for _ in range(n_episodes):
+from rl.env_utils import normalize_reset, normalize_step
+
+
+def evaluate(model, env, n_episodes: int = 20) -> Dict[str, float]:
+    returns = []
+    success = []
+    for _ in range(int(n_episodes)):
         obs = env.reset()
         done = False
         ep_ret = 0.0
+        info = {}
         while not done:
-            action, _ = ll_model.predict(obs, deterministic=True)
-            obs, r, done, info = env.step(action)
-            ep_ret += float(r)
-        rets.append(ep_ret)
-
-        # generic success heuristic: if env provides info["success"] use it; else positive return
-        if isinstance(info, dict) and "success" in info:
-            succ.append(float(info["success"]))
-        else:
-            succ.append(1.0 if ep_ret > 0 else 0.0)
-
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, info = env.step(action)
+            ep_ret += float(reward)
+        returns.append(ep_ret)
+        success.append(float(info.get("success", info.get("win", ep_ret > 0))))
     return {
-        "return_mean": float(np.mean(rets)),
-        "return_std": float(np.std(rets)),
-        "success_rate": float(np.mean(succ)),
+        "return_mean": float(np.mean(returns)),
+        "return_std": float(np.std(returns)),
+        "success_rate": float(np.mean(success)),
     }
-

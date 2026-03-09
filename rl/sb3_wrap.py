@@ -1,336 +1,207 @@
-# rl/sb3_wrap.py
 from __future__ import annotations
+
 from typing import Any, Dict, List, Optional
-import numpy as np
+
 import gym
+import numpy as np
 import torch
-import torch.nn.functional as F
 
-from .env_utils import normalize_reset, normalize_step, get_n_actions
-from .env_utils import get_instruction_paragraph, obs_to_text
-from .instruction_split import split_with_parser, split_with_lm
-from .retrieval import z_single, z_topk
-from .buffers import SelSegment
+from gym import spaces
+from rl.buffers import HLSegment
+from rl.env_utils import clone_obs, get_instruction_paragraph, normalize_reset, normalize_step
+from rl.instruction_split import split_with_lm, split_with_parser
 
-def onehot(action: int, n: int, device: str):
-    a = torch.zeros(n, device=device, dtype=torch.float32)
-    a[int(action)] = 1.0
-    return a
 
-class LLWrapper(gym.Wrapper):
-    """
-    Low-level wrapper that:
-      1) Builds observation = concat(h_s(t), z_k) where z_k is chosen by high-level selector every T steps.
-      2) Computes low-level reward r_ll = r_env / r_model / (r_env + lambda * r_model) per cfg.ll_reward.
-      3) Collects selector segments for REINFORCE updates (every T steps).
-      4) Collects reward-model supervised data (h_s, a_onehot, r_env).
+class HRLWrapper(gym.Env):
+    metadata = {"render.modes": []}
 
-    Trainer reads:
-      - self.last_sel: per-step bookkeeping (h_s, z_k, etc.)
-      - self.finished_segments: list[SelSegment] finalized since last trainer pull()
-    """
-
-    def __init__(
-        self,
-        env,
-        cfg,
-        minilm,
-        state_adapter,
-        instr_adapter,
-        pi_sel,
-        reward_model,
-        parse_instructions_fn=None,
-    ):
-        super().__init__(env)
+    def __init__(self, env, cfg, minilm, instr_adapter, state_encoder, selector, reward_model, action_dim: int):
+        super().__init__()
+        self.env = env
         self.cfg = cfg
         self.minilm = minilm
-        self.state_adapter = state_adapter
         self.instr_adapter = instr_adapter
-        self.pi_sel = pi_sel
-        self.rm = reward_model
-        self.parse_instructions_fn = parse_instructions_fn
+        self.state_encoder = state_encoder
+        self.selector = selector
+        self.reward_model = reward_model
+        self.action_dim = int(action_dim)
+        self.device = cfg.device
 
-        self.n_actions = get_n_actions(env)
-        self.action_space = gym.spaces.Discrete(self.n_actions)
+        #self.action_space = env.action_space
+        self.action_space = spaces.Discrete(action_dim)
+        self.observation_space = None
 
-        self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(cfg.state_dim + cfg.z_dim,), dtype=np.float32
-        )
+        self.current_raw_obs: Optional[Dict[str, Any]] = None
+        self.current_wrapped_obs: Optional[Dict[str, Any]] = None
+        self.current_z: Optional[torch.Tensor] = None
+        self.current_logp: Optional[torch.Tensor] = None
+        self.current_instr_idx: Optional[int] = None
+        self.current_instr_embs: Optional[torch.Tensor] = None
+        self.step_in_seg = 0
+        self.total_steps = 0
+        self.episode_id = 0
+        self.seg_idx = 0
+        self.seg_start_obs: Optional[Dict[str, Any]] = None
+        self.seg_env_rewards: List[float] = []
+        self.seg_rm_rewards: List[float] = []
+        self.seg_state_embs: List[torch.Tensor] = []
+        self.pending_bl: List[Dict[str, Any]] = []
+        self.pending_hl: List[HLSegment] = []
 
-        self._cached_paragraph: Optional[str] = None
-        self._cached_candidates: List[str] = []
-        self._cached_H: Optional[torch.Tensor] = None  # (1,N,z_dim)
+    def _to_device_obs(self, obs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+        for k, v in obs.items():
+            if isinstance(v, torch.Tensor):
+                t = v.to(self.device)
+            else:
+                t = torch.as_tensor(v, device=self.device)
+            if t.dtype == torch.float64:
+                t = t.float()
+            out[k] = t
+        return out
 
-        # high-level segment state
-        self._t_in_ep: int = 0
-        self._current_z: Optional[torch.Tensor] = None     # (z_dim,)
-        self._current_hi: Optional[torch.Tensor] = None    # (z_dim,)
-        self._current_logp: Optional[torch.Tensor] = None  # scalar tensor
-        self._current_probs: Optional[torch.Tensor] = None # (N,)
-        self._current_score_start: Optional[torch.Tensor] = None # scalar tensor
-        self._segment_rewards: List[float] = []
-        self._segment_hs: List[torch.Tensor] = []          # list[(state_dim,)] for cosine aux
-        self._segment_obs_start: Optional[torch.Tensor] = None  # (obs_dim,) CPU
-        self._segment_obs_end: Optional[torch.Tensor] = None    # (obs_dim,) CPU
-
-        self.last_sel: Dict[str, Any] = {}
-        self.finished_segments: List[SelSegment] = []
-
-    def _get_candidates(self, paragraph: str) -> List[str]:
-        if self.cfg.split_mode == "lm":
-            return split_with_lm(paragraph, self.cfg.max_instructions)
-        return split_with_parser(paragraph, self.cfg.max_instructions, self.parse_instructions_fn)
-
-    def _encode_instructions(self, paragraph: str) -> List[str]:
-        if paragraph != self._cached_paragraph:
-            self._cached_paragraph = paragraph
-            self._cached_candidates = self._get_candidates(paragraph)
-            self._cached_H = None
-        return self._cached_candidates
-
-    def _get_H(self, cands: List[str]) -> torch.Tensor:
-        # cache instruction embeddings across steps/segments (same paragraph)
-        if self._cached_H is None:
-            if not cands:
-                cands = ["(no instruction)"]
-            with torch.no_grad():
-                e_i = self.minilm.encode(cands)  # (N,emb)
-            H = self.instr_adapter(e_i).unsqueeze(0)  # (1,N,z_dim) (trainable)
-            self._cached_H = H
-        return self._cached_H
-
-    def _encode_state(self, obs: Dict[str, Any]) -> torch.Tensor:
-        with torch.no_grad():
-            st = obs_to_text(obs)
-            e_s = self.minilm.encode([st])  # (1,emb)
-        h_s = self.state_adapter(e_s)       # (1,state_dim)
-        return h_s
-
-    def _h_s_for_selector(self, h_s: torch.Tensor) -> torch.Tensor:
-        # control whether selector gradients flow into state encoder
-        if getattr(self.cfg, "state_encoder_update", "both") == "low":
-            return h_s.detach()
-        return h_s
-
-    def _obs_ll(self, h_s: torch.Tensor, z: torch.Tensor) -> np.ndarray:
-        obs_ll = torch.cat([h_s, z.unsqueeze(0)], dim=-1).squeeze(0).detach().cpu().numpy().astype(np.float32)
-        return obs_ll
-
-    def _discounted_sum(self, rewards: List[float]) -> float:
-        g = 0.0
-        p = 1.0
-        for r in rewards:
-            g += p * float(r)
-            p *= float(self.cfg.hl_gamma)
-        return float(g)
-
-    def _finalize_segment_with_boundary(self, h_s_end: torch.Tensor, probs_end: Optional[torch.Tensor]):
-        """Finalize the current segment using the boundary state (end of segment)."""
-        if self._current_logp is None:
-            return
-        R = self._discounted_sum(self._segment_rewards)
-
-        # --- R_aux computed here for types that don't need value function ---
-        aux_type = getattr(self.cfg, "hl_aux_type", "none")
-        R_aux = 0.0
-
-        # score difference: score(h_s_start, h_i*) - score(h_s_end, h_i*)
-        if aux_type == "score_diff" and self._current_hi is not None:
-            hs_end = self._h_s_for_selector(h_s_end)  # (1,D)
-            hi = self._current_hi.unsqueeze(0)        # (1,D)
-            with torch.no_grad():
-                s_end = self.pi_sel.scorer(torch.cat([hs_end, hi], dim=-1)).squeeze()
-                s_start = (self._current_score_start.squeeze() if self._current_score_start is not None else 0.0)
-                R_aux = float((s_start - s_end).detach().cpu().item())
-
-        # KL: KL(p_start || p_end) (pos or neg)
-        if aux_type in ["kl_pos", "kl_neg"] and (self._current_probs is not None) and (probs_end is not None):
-            p = self._current_probs.clamp_min(1e-8)
-            q = probs_end.clamp_min(1e-8)
-            with torch.no_grad():
-                kl = (p * (p.log() - q.log())).sum()
-                sign = 1.0 if aux_type == "kl_pos" else -1.0
-                R_aux = float((sign * kl).detach().cpu().item())
-
-        # cosine: cos(mean_t h_s(t), h_i*)
-        if aux_type == "cos" and (self._current_hi is not None) and self._segment_hs:
-            with torch.no_grad():
-                u = torch.stack([h.detach() for h in self._segment_hs], dim=0).mean(dim=0)
-                hi = self._current_hi.detach()
-                R_aux = float(F.cosine_similarity(u.unsqueeze(0), hi.unsqueeze(0), dim=-1).squeeze().cpu().item())
-
-        R_total = float(R + getattr(self.cfg, "hl_aux_scale", 1.0) * R_aux)
-
-        # store obs start/end for optional v-diff aux in trainer
-        seg = SelSegment(
-            logp=self._current_logp,
-            R=R_total,
-            obs_start=self._segment_obs_start,
-            obs_end=self._segment_obs_end,
-        )
-        self.finished_segments.append(seg)
-
-        # reset segment accumulators
-        self._current_logp = None
-        self._current_probs = None
-        self._current_hi = None
-        self._current_score_start = None
-        self._segment_rewards = []
-        self._segment_hs = []
-        self._segment_obs_start = None
-        self._segment_obs_end = None
-
-    def _select_if_needed(self, obs: Dict[str, Any]):
-        """Run selector at the start of an episode or at segment boundaries."""
+    def _split_instructions(self, obs: Dict[str, Any]) -> List[str]:
         paragraph = get_instruction_paragraph(self.env, obs)
-        cands = self._encode_instructions(paragraph)
-        H = self._get_H(cands)  # (1,N,D)
-
-        h_s = self._encode_state(obs)              # (1,D)
-        h_s_sel = self._h_s_for_selector(h_s)
-
-        # if we are at a boundary AND already have a running segment, we need the new probs for KL
-        sel = self.pi_sel(h_s_sel, H, greedy=False)  # keeps graph for logp
-
-        # decide z
-        if self.cfg.z_mode == "single":
-            z = z_single(H, sel.idx)  # (1,D)
+        if self.cfg.split_mode == "lm":
+            items = split_with_lm(paragraph)
         else:
-            z = z_topk(H, sel.scores, k=self.cfg.topk, pool=self.cfg.topk_pool)
+            items = split_with_parser(paragraph)
+        items = [s.strip() for s in items if s and s.strip()]
+        if not items:
+            items = ["(no instruction)"]
+        return items[: self.cfg.max_instructions]
 
-        # update current selection
-        idx0 = int(sel.idx.squeeze(0).detach().cpu().item())
-        self._current_z = z.squeeze(0)
-        self._current_hi = H[0, idx0]  # (D,)
-        self._current_logp = sel.logp.squeeze(0)  # scalar tensor with graph
-        self._current_probs = sel.probs.squeeze(0).detach()  # detach to avoid graph bloat
-        self._current_score_start = sel.scores[0, idx0].detach()
+    @torch.no_grad()
+    def _instruction_embeddings(self, obs: Dict[str, Any]) -> torch.Tensor:
+        tips = self._split_instructions(obs)
+        base = self.minilm.encode(tips)
+        return self.instr_adapter(base)
 
-        # start segment accumulators
-        self._segment_rewards = []
-        self._segment_hs = []
-        obs_ll = self._obs_ll(h_s, self._current_z)
-        self._segment_obs_start = torch.from_numpy(obs_ll).float()  # CPU tensor
+    @torch.no_grad()
+    def _state_embedding(self, obs: Dict[str, Any]) -> torch.Tensor:
+        obs_t = self._to_device_obs(obs)
+        return self.state_encoder(obs_t).squeeze(0)
 
-        # bookkeeping
-        self.last_sel = {
-            "h_s": h_s.squeeze(0),
-            "z_k": self._current_z,
-            "cands": cands,
-            "sel_logp": float(self._current_logp.detach().cpu().item()),
-            "sel_idx": idx0,
-        }
+    def _selector_step(self, obs: Dict[str, Any]) -> None:
+        obs_t = self._to_device_obs(obs)
+        h_s = self.state_encoder(obs_t)
+        self.current_instr_embs = self._instruction_embeddings(obs)
+        H = self.current_instr_embs.unsqueeze(0)
+        out = self.selector(h_s, H, mode=self.cfg.selector_mode)
+        self.current_instr_idx = int(out.idx.item())
+        self.current_logp = out.logp.squeeze(0)
+        self.current_z = out.selected.squeeze(0).detach()
+        self.seg_start_obs = clone_obs(obs)
+        self.seg_env_rewards = []
+        self.seg_rm_rewards = []
+        self.seg_state_embs = [h_s.squeeze(0).detach()]
 
-        return obs_ll, h_s, sel.probs.squeeze(0).detach()
+    def _wrap_obs(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        wrapped = clone_obs(obs)
+        wrapped["z"] = self.current_z.detach().cpu().numpy().astype(np.float32)
+        return wrapped
+
+    def _rm_predict(self, obs: Dict[str, Any], action: int, next_obs: Dict[str, Any]) -> float:
+        with torch.no_grad():
+            h_s = self._state_embedding(obs).unsqueeze(0)
+            h_sp1 = self._state_embedding(next_obs).unsqueeze(0)
+            a = torch.tensor([action], device=self.device)
+            z = self.current_z.unsqueeze(0).to(self.device) if self.current_z is not None else None
+            pred = self.reward_model.predict_reward(h_s, a, h_sp1=h_sp1 if self.cfg.rm_variant in {"sas", "sasz"} else None, z=z if self.cfg.rm_variant == "sasz" else None)
+            return float(pred.item())
+
+    def _ll_reward(self, r_env: float, r_rm: float) -> float:
+        if self.cfg.ll_reward == "env":
+            return float(r_env)
+        if self.cfg.ll_reward == "rm":
+            return float(r_rm)
+        return float(r_env + self.cfg.ll_lambda * r_rm)
+
+    def _aux_reward(self, obs_end: Dict[str, Any]) -> float:
+        if self.cfg.hl_aux_type == "none":
+            return 0.0
+        if self.cfg.hl_aux_type == "cos":
+            if self.current_z is None or not self.seg_state_embs:
+                return 0.0
+            mean_h = torch.stack(self.seg_state_embs, dim=0).mean(dim=0)
+            z = self.current_z.to(mean_h.device)
+            return float(torch.nn.functional.cosine_similarity(mean_h.unsqueeze(0), z.unsqueeze(0), dim=-1).item())
+        if self.cfg.hl_aux_type == "v_diff":
+            return 0.0
+        raise ValueError(f"Unknown aux type: {self.cfg.hl_aux_type}")
+
+    def _finalize_segment(self, obs_end: Dict[str, Any], done: bool) -> None:
+        if self.seg_start_obs is None or self.current_logp is None or self.current_z is None or self.current_instr_idx is None:
+            return
+        base_return = sum(self.seg_rm_rewards) if self.cfg.hl_return_source == "rm" else sum(self.seg_env_rewards)
+        aux_reward = self._aux_reward(obs_end)
+        seg = HLSegment(
+            episode_id=self.episode_id,
+            seg_idx=self.seg_idx,
+            obs_start=clone_obs(self.seg_start_obs),
+            obs_end=clone_obs(obs_end),
+            action_idx=int(self.current_instr_idx),
+            logp=self.current_logp,
+            z=self.current_z.detach().cpu(),
+            base_return=float(base_return),
+            aux_reward=float(aux_reward),
+            done=bool(done),
+        )
+        self.pending_hl.append(seg)
+        self.seg_idx += 1
 
     def reset(self, **kwargs):
-        obs, _ = normalize_reset(self.env.reset(**kwargs))
-        self._cached_paragraph = None
-        self._cached_candidates = []
-        self._cached_H = None
+        obs, info = normalize_reset(self.env.reset(**kwargs))
+        self.episode_id += 1
+        self.seg_idx = 0
+        self.step_in_seg = 0
+        self.total_steps = 0
+        self.current_raw_obs = clone_obs(obs)
+        self._selector_step(self.current_raw_obs)
+        wrapped = self._wrap_obs(self.current_raw_obs)
+        self.current_wrapped_obs = clone_obs(wrapped)
+        return wrapped
 
-        self._t_in_ep = 0
-        self.finished_segments = []
+    def step(self, action):
+        prev_raw = clone_obs(self.current_raw_obs)
+        out = self.env.step(int(action))
+        next_obs, r_env, done, info = normalize_step(out)
+        r_rm = self._rm_predict(prev_raw, int(action), next_obs)
+        reward = self._ll_reward(r_env, r_rm)
 
-        obs_ll, h_s, _ = self._select_if_needed(obs)
-        # include current h_s for cosine
-        self._segment_hs.append(h_s.squeeze(0))
-        return obs_ll
+        self.seg_env_rewards.append(float(r_env))
+        self.seg_rm_rewards.append(float(r_rm))
+        self.seg_state_embs.append(self._state_embedding(next_obs).detach())
 
-    def step(self, action: int):
-        # --- transition bookkeeping for reward-model inputs ---
-        h_s_prev = self.last_sel["h_s"].to(self.cfg.device)  # (state_dim,)
-        z_prev = self.last_sel.get("z_k", None)
-        if z_prev is not None:
-            z_prev = z_prev.to(self.cfg.device)
-        a_oh = onehot(int(action), self.n_actions, self.cfg.device)
+        self.pending_bl.append(
+            {
+                "obs": clone_obs(prev_raw),
+                "action": int(action),
+                "reward": float(r_env),
+                "next_obs": clone_obs(next_obs),
+                "done": bool(done),
+                "z": self.current_z.detach().cpu().clone(),
+            }
+        )
 
-        # step env first (so we can use s_{t+1} for rm_variant='sas'/'sasz')
-        obs2, r_env, done, info = normalize_step(self.env.step(int(action)))
-        info = dict(info) if isinstance(info, dict) else {}
-
-        # encode next state (for boundary checks and for rm variants that depend on s_{t+1})
-        paragraph2 = get_instruction_paragraph(self.env, obs2)
-        cands2 = self._encode_instructions(paragraph2)
-        H2 = self._get_H(cands2)
-        h_s2 = self._encode_state(obs2)          # (1,D)
-        h_s2_sel = self._h_s_for_selector(h_s2)  # (1,D)
-        sel2 = self.pi_sel(h_s2_sel, H2, greedy=False)
-        probs2 = sel2.probs.squeeze(0).detach()
-
-        # --- compute reward-model prediction ---
-        var = getattr(self.cfg, "rm_variant", "sa")
-        with torch.no_grad():
-            if var == "sa":
-                r_model_t = self.rm(h_s_prev.unsqueeze(0), a_oh.unsqueeze(0))
-            elif var == "sas":
-                r_model_t = self.rm(h_s_prev.unsqueeze(0), a_oh.unsqueeze(0), h_s2.to(self.cfg.device))
-            elif var == "sasz":
-                if z_prev is None:
-                    z_prev = torch.zeros(self.cfg.z_dim, device=self.cfg.device)
-                r_model_t = self.rm(h_s_prev.unsqueeze(0), a_oh.unsqueeze(0), h_s2.to(self.cfg.device), z_prev.unsqueeze(0))
-            else:
-                raise ValueError(f"Unknown cfg.rm_variant={var}")
-            r_model = float(r_model_t.squeeze().cpu().item())
-
-        # low-level reward
-        if self.cfg.ll_reward == "rm":
-            r_ll = float(r_model)
-        elif self.cfg.ll_reward == "mix":
-            r_ll = float(r_env) + float(self.cfg.ll_lambda) * float(r_model)
-        else:
-            r_ll = float(r_env)
-
-        info["r_env"] = float(r_env)
-        info["r_model"] = float(r_model)
-        info["r_ll"] = float(r_ll)
-
-        # expose (s,a,s',z) for RMBuffer via callback
-        self.last_sel["h_s_prev"] = h_s_prev.detach()
-        self.last_sel["h_s_next"] = h_s2.squeeze(0).detach()
-        if z_prev is not None:
-            self.last_sel["z_k"] = z_prev.detach()
-
-        # accumulate segment rewards / hs
-        self._segment_rewards.append(float(r_ll))
-
-        end_of_segment = bool(done) or ((self._t_in_ep + 1) % int(self.cfg.hl_T) == 0)
-
-        if end_of_segment:
-            # store obs_end for optional v-diff
-            obs_ll_end = self._obs_ll(
-                h_s2,
-                self._current_z if self._current_z is not None else torch.zeros(self.cfg.z_dim, device=h_s2.device),
-            )
-            self._segment_obs_end = torch.from_numpy(obs_ll_end).float()
-            self._finalize_segment_with_boundary(h_s2, probs2)
-
+        self.step_in_seg += 1
+        self.total_steps += 1
+        segment_done = done or (self.step_in_seg >= int(self.cfg.hl_T))
+        if segment_done:
+            self._finalize_segment(next_obs, done)
+            self.step_in_seg = 0
             if not done:
-                # start new segment with selection at boundary
-                obs_ll, h_s_new, _ = self._select_if_needed(obs2)
-                self._segment_hs.append(h_s_new.squeeze(0))
-                self._t_in_ep += 1
-                return obs_ll, float(r_ll), bool(done), info
+                self._selector_step(next_obs)
 
-        # not end-of-segment: keep z, just update observation with new h_s
-        if self._current_z is None:
-            self._current_z = torch.zeros(self.cfg.z_dim, device=h_s2.device)
-
-        obs_ll = self._obs_ll(h_s2, self._current_z)
-        self.last_sel["h_s"] = h_s2.squeeze(0)
-        self._segment_hs.append(h_s2.squeeze(0))
-
-        self._t_in_ep += 1
-        return obs_ll, float(r_ll), bool(done), info
-
-        # not end-of-segment: keep z, just update observation with new h_s
-        if self._current_z is None:
-            # safety fallback
-            self._current_z = torch.zeros(self.cfg.z_dim, device=h_s2.device)
-
-        obs_ll = self._obs_ll(h_s2, self._current_z)
-        self.last_sel["h_s"] = h_s2.squeeze(0)
-        self._segment_hs.append(h_s2.squeeze(0))
-
-        self._t_in_ep += 1
-        return obs_ll, float(r_ll), bool(done), info
+        self.current_raw_obs = clone_obs(next_obs)
+        wrapped = self._wrap_obs(self.current_raw_obs)
+        self.current_wrapped_obs = clone_obs(wrapped)
+        info = dict(info)
+        info.update(
+            {
+                "r_env": float(r_env),
+                "r_rm": float(r_rm),
+                "segment_done": bool(segment_done),
+            }
+        )
+        return wrapped, float(reward), bool(done), info
