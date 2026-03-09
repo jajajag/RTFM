@@ -73,11 +73,11 @@ def parse_args():
     ap.add_argument("--shuffle-wiki", action="store_true")
     ap.add_argument("--time-penalty", type=float, default=0.0)
 
-    ap.add_argument("--split-mode", choices=["parser", "lm"], default="parser")
+    ap.add_argument("--split-mode", choices=["parser", "lm"], default="lm")
     ap.add_argument("--max-instructions", type=int, default=64)
 
     ap.add_argument("--state-encoder-type", choices=["mlp", "conv", "film", "txt2pi"], default="txt2pi")
-    ap.add_argument("--selector-mode", choices=["hard", "sample"], default="sample")
+    ap.add_argument("--selector-mode", choices=["hard", "sample"], default="hard")
 
     ap.add_argument("--hl-T", type=int, default=5)
     ap.add_argument("--hl-gamma", type=float, default=0.99)
