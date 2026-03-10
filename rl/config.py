@@ -60,6 +60,6 @@ class Config:
     rm_updates_per_call: int = 100
 
     # Training / eval
-    total_steps: int = 200000
-    eval_every_steps: int = 10000
+    total_steps: int = 1000000
+    eval_every_steps: int = 5000
     eval_episodes: int = 20
