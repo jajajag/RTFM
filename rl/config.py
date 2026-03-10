@@ -24,7 +24,7 @@ class Config:
     adapter_hidden: int = 256
 
     # State encoder
-    state_encoder_type: str = "txt2pi"  # mlp | conv | film | txt2pi
+    state_encoder_type: str = "conv"  # mlp | conv | film | txt2pi
     token_emb_dim: int = 64
     text_rnn_dim: int = 64
     state_hidden: int = 128
