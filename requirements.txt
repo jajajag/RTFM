@@ -1,7 +1,0 @@
-vocab>=0.0.4
-embeddings>=0.0.7
-revtok>=0.0.3
-py-getch==1.0.1
-gym==0.21.0
-stable-baselines3==1.8.0
-shimmy==0.2.1
