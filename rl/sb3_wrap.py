@@ -27,16 +27,14 @@ class HRLWrapper(gym.Env):
         self.action_dim = int(action_dim)
         self.device = cfg.device
 
-        #self.action_space = env.action_space
         self.action_space = spaces.Discrete(action_dim)
         self.observation_space = None
 
         self.current_raw_obs: Optional[Dict[str, Any]] = None
         self.current_wrapped_obs: Optional[Dict[str, Any]] = None
         self.current_z: Optional[torch.Tensor] = None
-        self.current_logp: Optional[torch.Tensor] = None
         self.current_instr_idx: Optional[int] = None
-        self.current_instr_embs: Optional[torch.Tensor] = None
+        self.current_instructions: List[str] = []
         self.step_in_seg = 0
         self.total_steps = 0
         self.episode_id = 0
@@ -47,6 +45,7 @@ class HRLWrapper(gym.Env):
         self.seg_state_embs: List[torch.Tensor] = []
         self.pending_bl: List[Dict[str, Any]] = []
         self.pending_hl: List[HLSegment] = []
+        self.collect_experience = True
 
     def _to_device_obs(self, obs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         out: Dict[str, torch.Tensor] = {}
@@ -73,7 +72,7 @@ class HRLWrapper(gym.Env):
 
     @torch.no_grad()
     def _instruction_embeddings(self, obs: Dict[str, Any]) -> torch.Tensor:
-        tips = self._split_instructions(obs)
+        tips = self.current_instructions or self._split_instructions(obs)
         base = self.minilm.encode(tips)
         return self.instr_adapter(base)
 
@@ -82,14 +81,15 @@ class HRLWrapper(gym.Env):
         obs_t = self._to_device_obs(obs)
         return self.state_encoder(obs_t).squeeze(0)
 
+    @torch.no_grad()
     def _selector_step(self, obs: Dict[str, Any]) -> None:
         obs_t = self._to_device_obs(obs)
         h_s = self.state_encoder(obs_t)
-        self.current_instr_embs = self._instruction_embeddings(obs)
-        H = self.current_instr_embs.unsqueeze(0)
-        out = self.selector(h_s, H, mode=self.cfg.selector_mode)
+        self.current_instructions = self._split_instructions(obs)
+        instr_embs = self._instruction_embeddings(obs)
+        H = instr_embs.unsqueeze(0)
+        out = self.selector(h_s, H, mode=self.cfg.selector_train_mode)
         self.current_instr_idx = int(out.idx.item())
-        self.current_logp = out.logp.squeeze(0)
         self.current_z = out.selected.squeeze(0).detach()
         self.seg_start_obs = clone_obs(obs)
         self.seg_env_rewards = []
@@ -131,7 +131,9 @@ class HRLWrapper(gym.Env):
         raise ValueError(f"Unknown aux type: {self.cfg.hl_aux_type}")
 
     def _finalize_segment(self, obs_end: Dict[str, Any], done: bool) -> None:
-        if self.seg_start_obs is None or self.current_logp is None or self.current_z is None or self.current_instr_idx is None:
+        if not self.collect_experience:
+            return
+        if self.seg_start_obs is None or self.current_z is None or self.current_instr_idx is None:
             return
         base_return = sum(self.seg_rm_rewards) if self.cfg.hl_return_source == "rm" else sum(self.seg_env_rewards)
         aux_reward = self._aux_reward(obs_end)
@@ -140,8 +142,8 @@ class HRLWrapper(gym.Env):
             seg_idx=self.seg_idx,
             obs_start=clone_obs(self.seg_start_obs),
             obs_end=clone_obs(obs_end),
+            instructions=list(self.current_instructions),
             action_idx=int(self.current_instr_idx),
-            logp=self.current_logp,
             z=self.current_z.detach().cpu(),
             base_return=float(base_return),
             aux_reward=float(aux_reward),
@@ -173,16 +175,17 @@ class HRLWrapper(gym.Env):
         self.seg_rm_rewards.append(float(r_rm))
         self.seg_state_embs.append(self._state_embedding(next_obs).detach())
 
-        self.pending_bl.append(
-            {
-                "obs": clone_obs(prev_raw),
-                "action": int(action),
-                "reward": float(r_env),
-                "next_obs": clone_obs(next_obs),
-                "done": bool(done),
-                "z": self.current_z.detach().cpu().clone(),
-            }
-        )
+        if self.collect_experience:
+            self.pending_bl.append(
+                {
+                    "obs": clone_obs(prev_raw),
+                    "action": int(action),
+                    "reward": float(r_env),
+                    "next_obs": clone_obs(next_obs),
+                    "done": bool(done),
+                    "z": self.current_z.detach().cpu().clone(),
+                }
+            )
 
         self.step_in_seg += 1
         self.total_steps += 1

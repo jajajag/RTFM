@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -8,11 +9,12 @@ class Config:
     device: str = "cpu"
 
     # Environment / observations
-    room_shape: int = 6
+    use_rtfm_env_defaults: bool = False
+    room_shape: Optional[int] = 6
     partially_observable: bool = False
-    max_placement: int = 1
+    max_placement: Optional[int] = 1
     shuffle_wiki: bool = False
-    time_penalty: float = 0.0
+    time_penalty: Optional[float] = 0.0
 
     # Instruction processing
     split_mode: str = "parser"
@@ -30,14 +32,15 @@ class Config:
     state_hidden: int = 128
 
     # High-level selector
-    hl_T: int = 5
+    hl_T: int = 10
     hl_gamma: float = 0.99
     hl_lr: float = 3e-4
     hl_update_every_steps: int = 1000
-    selector_mode: str = "sample"  # hard | sample
+    selector_train_mode: str = "sample"  # hard | sample
+    selector_eval_mode: str = "hard"     # hard | sample
     hl_return_source: str = "rm"   # rm | env
     hl_aux_type: str = "cos"       # none | cos | v_diff
-    hl_aux_lambda: float = 1.0
+    hl_aux_lambda: float = 0.1
 
     # Low-level policy / shaping
     ll_algo: str = "ppo"
@@ -58,6 +61,10 @@ class Config:
     rm_batch_size: int = 256
     rm_buffer_capacity: int = 200000
     rm_updates_per_call: int = 100
+    rm_loss: str = "mse"  # mse | huber | ce
+    rm_balanced_sampling: bool = False
+    rm_nonzero_fraction: float = 0.25
+    rm_classification_threshold: float = 0.5
 
     # Training / eval
     total_steps: int = 1000000

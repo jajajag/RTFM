@@ -54,6 +54,25 @@ class BLBuffer:
             return None
         return random.sample(self.data, batch_size)
 
+    def sample_balanced(self, batch_size: int, nonzero_fraction: float) -> Optional[List[BLTransition]]:
+        if len(self.data) < batch_size:
+            return None
+
+        nonzero = [x for x in self.data if abs(float(x.reward)) > 1e-8]
+        zero = [x for x in self.data if abs(float(x.reward)) <= 1e-8]
+        if not nonzero or not zero or nonzero_fraction <= 0:
+            return self.sample(batch_size)
+
+        n_nonzero = min(len(nonzero), int(round(batch_size * float(nonzero_fraction))))
+        n_zero = batch_size - n_nonzero
+        if n_zero > len(zero):
+            n_zero = len(zero)
+            n_nonzero = batch_size - n_zero
+
+        batch = random.sample(nonzero, n_nonzero) + random.sample(zero, n_zero)
+        random.shuffle(batch)
+        return batch
+
     def __len__(self) -> int:
         return len(self.data)
 
@@ -64,8 +83,8 @@ class HLSegment:
     seg_idx: int
     obs_start: RawObs
     obs_end: RawObs
+    instructions: List[str]
     action_idx: int
-    logp: torch.Tensor
     z: torch.Tensor
     base_return: float
     aux_reward: float

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict
 
 import numpy as np
 import torch
@@ -78,15 +78,6 @@ class BaseStateEncoder(nn.Module):
                 t = t.float()
             out[k] = t
         return out
-
-    def _batch(self, obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        obs = self._to_device(obs)
-        out: Dict[str, torch.Tensor] = {}
-        for k, v in obs.items():
-            out[k] = v.unsqueeze(0) if v.dim() == len(v.shape) else v
-        if obs["name"].dim() == 5:
-            return {k: (v.unsqueeze(0) if v.dim() >= 1 and k != "z" else v) for k, v in obs.items()}
-        return obs
 
     def _prepare(self, obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         obs = self._to_device(obs)
@@ -190,6 +181,14 @@ class BaseStateEncoder(nn.Module):
     def encode_task(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
         return self.encode_text_field(obs["task"].long(), obs["task_len"].view(-1).long())
 
+    @staticmethod
+    def encode_progress(obs: Dict[str, torch.Tensor], bsz: int, device: torch.device) -> torch.Tensor:
+        progress = obs.get("progress")
+        if progress is None:
+            return torch.zeros(bsz, 1, device=device)
+        progress = progress.float().view(bsz, -1)
+        return progress.mean(dim=-1, keepdim=True)
+
 
 class MLPStateEncoder(BaseStateEncoder):
     def __init__(self, vocab_size: int, out_dim: int, token_emb_dim: int, text_rnn_dim: int, hidden_dim: int, padding_idx: int = 0):
@@ -222,7 +221,7 @@ class ConvStateEncoder(BaseStateEncoder):
             nn.ReLU(),
         )
         self.fc = nn.Sequential(
-            nn.Linear(64, out_dim),
+            nn.Linear(64 + 1, out_dim),
             nn.Tanh(),
         )
 
@@ -237,7 +236,8 @@ class ConvStateEncoder(BaseStateEncoder):
         text = (wiki + task).unsqueeze(1).unsqueeze(1).expand(bsz, h, w, -1)
         grid = torch.cat([cell, inv_grid, text], dim=-1).permute(0, 3, 1, 2)
         feat = self.conv(grid).amax(dim=(2, 3))
-        return self.fc(feat)
+        progress = self.encode_progress(obs, bsz, feat.device)
+        return self.fc(torch.cat([feat, progress], dim=-1))
 
 
 class FiLMBlock(nn.Module):
@@ -260,7 +260,7 @@ class FiLMStateEncoder(BaseStateEncoder):
         self.init = nn.Conv2d(self.text_dim + 2, 32, kernel_size=3, padding=1)
         self.f1 = FiLMBlock(32, 64, self.text_dim * 3)
         self.f2 = FiLMBlock(64, 64, self.text_dim * 3)
-        self.fc = nn.Sequential(nn.Linear(64, out_dim), nn.Tanh())
+        self.fc = nn.Sequential(nn.Linear(64 + 1, out_dim), nn.Tanh())
 
     def forward(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
         obs = self._prepare(obs)
@@ -278,7 +278,8 @@ class FiLMStateEncoder(BaseStateEncoder):
         x = self.f1(x, cond)
         x = self.f2(x, cond)
         feat = x.amax(dim=(2, 3))
-        return self.fc(feat)
+        progress = self.encode_progress(obs, feat.size(0), feat.device)
+        return self.fc(torch.cat([feat, progress], dim=-1))
 
 
 class Txt2PiStateEncoder(BaseStateEncoder):
@@ -289,7 +290,7 @@ class Txt2PiStateEncoder(BaseStateEncoder):
         self.f2 = FiLMBlock(64, 64, self.text_dim)
         self.query = nn.Linear(64, self.text_dim)
         self.fc = nn.Sequential(
-            nn.Linear(64 + self.text_dim * 2, hidden_dim),
+            nn.Linear(64 + self.text_dim * 2 + 1, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, out_dim),
             nn.Tanh(),
@@ -367,7 +368,8 @@ class Txt2PiStateEncoder(BaseStateEncoder):
         cond2 = wiki_attn2 + task
         x = self.f2(x, cond2)
         pooled = x.amax(dim=(2, 3))
-        return self.fc(torch.cat([pooled, inv, task], dim=-1))
+        progress = self.encode_progress(obs, pooled.size(0), pooled.device)
+        return self.fc(torch.cat([pooled, inv, task, progress], dim=-1))
 
 
 class StateZExtractor(nn.Module):

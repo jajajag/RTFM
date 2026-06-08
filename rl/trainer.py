@@ -45,10 +45,8 @@ class HRLCallback(BaseCallback):
         self.step_count += 1
 
         if self.step_count % int(self.trainer.cfg.hl_update_every_steps) == 0:
-            self.trainer.update_selector(self.trainer.ll_model)
-
-        if self.step_count % int(self.trainer.cfg.hl_update_every_steps) == 0:
             self.trainer.update_reward_model()
+            self.trainer.update_selector(self.trainer.ll_model)
 
         return True
 
@@ -80,14 +78,10 @@ class Trainer:
                 t = torch.as_tensor(v, device=self.device)
             if t.dtype == torch.float64:
                 t = t.float()
-            if t.dim() == len(t.shape):
-                out[k] = t.unsqueeze(0)
-            else:
-                out[k] = t
+            out[k] = t
         return out
 
     def _encode_state(self, obs: Dict, grad: bool = True) -> torch.Tensor:
-        fn = self.state_encoder if grad else torch.no_grad()
         if grad:
             return self.state_encoder(self._obs_to_device(obs))
         with torch.no_grad():
@@ -105,7 +99,13 @@ class Trainer:
             return
         self.reward_model.train()
         for _ in range(int(self.cfg.rm_updates_per_call)):
-            batch = self.bl_buffer.sample(self.cfg.rm_batch_size)
+            if getattr(self.cfg, "rm_balanced_sampling", False):
+                batch = self.bl_buffer.sample_balanced(
+                    self.cfg.rm_batch_size,
+                    getattr(self.cfg, "rm_nonzero_fraction", 0.25),
+                )
+            else:
+                batch = self.bl_buffer.sample(self.cfg.rm_batch_size)
             if batch is None:
                 break
             hs_list = []
@@ -123,14 +123,26 @@ class Trainer:
             h_sp1 = torch.stack(hsp1_list, dim=0)
             a = torch.tensor(a_list, device=self.device)
             z = torch.stack(z_list, dim=0)
-            pred = self.reward_model.predict_reward(
+            a_onehot = F.one_hot(a.long(), num_classes=self.reward_model.action_dim).float()
+            raw_pred = self.reward_model(
                 h_s,
-                a,
+                a_onehot,
                 h_sp1=h_sp1 if self.cfg.rm_variant in {"sas", "sasz"} else None,
                 z=z if self.cfg.rm_variant == "sasz" else None,
             )
             target = torch.tensor(r_list, device=self.device, dtype=torch.float32)
-            loss = F.mse_loss(pred, target)
+            if self.cfg.rm_loss == "ce":
+                threshold = float(getattr(self.cfg, "rm_classification_threshold", 0.5))
+                cls = torch.ones_like(target, dtype=torch.long)
+                cls = torch.where(target > threshold, torch.full_like(cls, 2), cls)
+                cls = torch.where(target < -threshold, torch.zeros_like(cls), cls)
+                loss = F.cross_entropy(raw_pred, cls)
+            else:
+                pred = raw_pred.squeeze(-1)
+                if self.cfg.rm_loss == "huber":
+                    loss = F.smooth_l1_loss(pred, target)
+                else:
+                    loss = F.mse_loss(pred, target)
             self.opt_rm.zero_grad(set_to_none=True)
             loss.backward()
             self.opt_rm.step()
@@ -171,21 +183,14 @@ class Trainer:
 
             for seg, ret in zip(ep_segments, returns):
                 h_s = self._encode_state(seg.obs_start, grad=True)
-                z = seg.z.to(self.device).unsqueeze(0)
-                tips = self.minilm.encode([seg.obs_start.get("_tip_text", "")]) if False else None
-                # Recompute instruction embeddings from the current episode text.
-                # The wrapper stores only the selected index, so we rebuild the candidate set from obs_start.
-                from rl.env_utils import get_instruction_paragraph
-                from rl.instruction_split import split_with_lm, split_with_parser
-                paragraph = get_instruction_paragraph(None, seg.obs_start)
-                if self.cfg.split_mode == "lm":
-                    instructions = split_with_lm(paragraph)
-                else:
-                    instructions = split_with_parser(paragraph)
-                instructions = [s for s in instructions if s.strip()][: self.cfg.max_instructions] or ["(no instruction)"]
+                instructions = [s for s in seg.instructions if s and s.strip()]
+                if not instructions or seg.action_idx >= len(instructions):
+                    continue
                 H = self.instr_adapter(self.minilm.encode(instructions)).unsqueeze(0)
-                out = self.selector(h_s, H, mode=self.cfg.selector_mode)
-                chosen_logp = out.logp.squeeze(0)
+                out = self.selector(h_s, H, mode=self.cfg.selector_train_mode)
+                log_probs = F.log_softmax(out.scores, dim=-1)
+                idx = torch.tensor([seg.action_idx], device=self.device)
+                chosen_logp = log_probs.gather(1, idx.view(1, 1)).squeeze()
                 total_terms.append(-chosen_logp * float(ret))
             if total_terms:
                 losses.append(torch.stack(total_terms).mean())

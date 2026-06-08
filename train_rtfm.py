@@ -31,11 +31,11 @@ def _unwrap_env(env):
 
 def make_env(
     level: str,
-    room_shape: int,
+    room_shape,
     partially_observable: bool,
-    max_placement: int,
+    max_placement,
     shuffle_wiki: bool,
-    time_penalty: float,
+    time_penalty,
 ):
     import gym
     import rtfm.tasks
@@ -48,15 +48,19 @@ def make_env(
         X.Progress(),
     ])
 
-    env = gym.make(
-        level,
-        room_shape=(room_shape, room_shape),
+    env_kwargs = dict(
         partially_observable=partially_observable,
-        max_placement=max_placement,
         featurizer=feat,
         shuffle_wiki=shuffle_wiki,
-        time_penalty=time_penalty,
     )
+    if room_shape is not None:
+        env_kwargs["room_shape"] = (room_shape, room_shape)
+    if max_placement is not None:
+        env_kwargs["max_placement"] = max_placement
+    if time_penalty is not None:
+        env_kwargs["time_penalty"] = time_penalty
+
+    env = gym.make(level, **env_kwargs)
     env = _unwrap_env(env)
     return env
 
@@ -68,6 +72,7 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
+    ap.add_argument("--use-rtfm-env-defaults", action="store_true")
     ap.add_argument("--room-shape", type=int, default=6)
     ap.add_argument("--partially-observable", action="store_true")
     ap.add_argument("--max-placement", type=int, default=1)
@@ -78,14 +83,15 @@ def parse_args():
     ap.add_argument("--max-instructions", type=int, default=64)
 
     ap.add_argument("--state-encoder-type", choices=["mlp", "conv", "film", "txt2pi"], default="conv")
-    ap.add_argument("--selector-mode", choices=["hard", "sample"], default="hard")
+    ap.add_argument("--selector-train-mode", choices=["hard", "sample"], default="sample")
+    ap.add_argument("--selector-eval-mode", choices=["hard", "sample"], default="hard")
 
-    ap.add_argument("--hl-T", type=int, default=5)
+    ap.add_argument("--hl-T", type=int, default=10)
     ap.add_argument("--hl-gamma", type=float, default=0.99)
     ap.add_argument("--hl-update-every-steps", type=int, default=1000)
     ap.add_argument("--hl-return-source", choices=["rm", "env"], default="rm")
     ap.add_argument("--hl-aux-type", choices=["none", "cos", "v_diff"], default="cos")
-    ap.add_argument("--hl-aux-lambda", type=float, default=1.0)
+    ap.add_argument("--hl-aux-lambda", type=float, default=0.1)
 
     ap.add_argument("--ll-algo", choices=["ppo"], default="ppo")
     ap.add_argument("--ll-reward", choices=["env", "rm", "mix"], default="mix")
@@ -96,6 +102,10 @@ def parse_args():
     ap.add_argument("--xi-l", type=float, default=1.0)
 
     ap.add_argument("--rm-variant", choices=["sa", "sas", "sasz"], default="sas")
+    ap.add_argument("--rm-loss", choices=["mse", "huber", "ce"], default="mse")
+    ap.add_argument("--rm-balanced-sampling", action="store_true")
+    ap.add_argument("--rm-nonzero-fraction", type=float, default=0.25)
+    ap.add_argument("--rm-classification-threshold", type=float, default=0.5)
 
     ap.add_argument("--state-dim", type=int, default=256)
     ap.add_argument("--instr-dim", type=int, default=256)
@@ -119,15 +129,17 @@ def main():
         level=args.level,
         seed=args.seed,
         device=args.device,
-        room_shape=args.room_shape,
+        use_rtfm_env_defaults=args.use_rtfm_env_defaults,
+        room_shape=None if args.use_rtfm_env_defaults else args.room_shape,
         partially_observable=args.partially_observable,
-        max_placement=args.max_placement,
+        max_placement=None if args.use_rtfm_env_defaults else args.max_placement,
         shuffle_wiki=args.shuffle_wiki,
-        time_penalty=args.time_penalty,
+        time_penalty=None if args.use_rtfm_env_defaults else args.time_penalty,
         split_mode=args.split_mode,
         max_instructions=args.max_instructions,
         state_encoder_type=args.state_encoder_type,
-        selector_mode=args.selector_mode,
+        selector_train_mode=args.selector_train_mode,
+        selector_eval_mode=args.selector_eval_mode,
         hl_T=args.hl_T,
         hl_gamma=args.hl_gamma,
         hl_update_every_steps=args.hl_update_every_steps,
@@ -141,6 +153,10 @@ def main():
         xi_H=args.xi_h,
         xi_L=args.xi_l,
         rm_variant=args.rm_variant,
+        rm_loss=args.rm_loss,
+        rm_balanced_sampling=args.rm_balanced_sampling,
+        rm_nonzero_fraction=args.rm_nonzero_fraction,
+        rm_classification_threshold=args.rm_classification_threshold,
         state_dim=args.state_dim,
         instr_dim=args.instr_dim,
         token_emb_dim=args.token_emb_dim,
@@ -215,6 +231,7 @@ def main():
         hidden=cfg.rm_hidden,
         z_dim=cfg.instr_dim,
         rm_variant=cfg.rm_variant,
+        output_dim=3 if cfg.rm_loss == "ce" else 1,
     ).to(cfg.device)
 
     hrl_env = HRLWrapper(
