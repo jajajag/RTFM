@@ -101,10 +101,11 @@ def parse_args():
     ap.add_argument("--xi-h", type=float, default=1.0)
     ap.add_argument("--xi-l", type=float, default=1.0)
 
-    ap.add_argument("--rm-variant", choices=["sa", "sas", "sasz"], default="sas")
+    ap.add_argument("--rm-variant", choices=["sa", "sas", "sasz", "success"], default="sas")
     ap.add_argument("--rm-loss", choices=["mse", "huber", "ce"], default="mse")
     ap.add_argument("--rm-balanced-sampling", action="store_true")
     ap.add_argument("--rm-nonzero-fraction", type=float, default=0.25)
+    ap.add_argument("--rm-success-positive-fraction", type=float, default=0.5)
     ap.add_argument("--rm-classification-threshold", type=float, default=0.5)
 
     ap.add_argument("--state-dim", type=int, default=256)
@@ -156,6 +157,7 @@ def main():
         rm_loss=args.rm_loss,
         rm_balanced_sampling=args.rm_balanced_sampling,
         rm_nonzero_fraction=args.rm_nonzero_fraction,
+        rm_success_positive_fraction=args.rm_success_positive_fraction,
         rm_classification_threshold=args.rm_classification_threshold,
         state_dim=args.state_dim,
         instr_dim=args.instr_dim,
@@ -231,7 +233,7 @@ def main():
         hidden=cfg.rm_hidden,
         z_dim=cfg.instr_dim,
         rm_variant=cfg.rm_variant,
-        output_dim=3 if cfg.rm_loss == "ce" else 1,
+        output_dim=3 if cfg.rm_loss == "ce" and cfg.rm_variant != "success" else 1,
     ).to(cfg.device)
 
     hrl_env = HRLWrapper(

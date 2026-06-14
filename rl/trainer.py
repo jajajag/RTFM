@@ -99,7 +99,12 @@ class Trainer:
             return
         self.reward_model.train()
         for _ in range(int(self.cfg.rm_updates_per_call)):
-            if getattr(self.cfg, "rm_balanced_sampling", False):
+            if self.cfg.rm_variant == "success" and getattr(self.cfg, "rm_balanced_sampling", False):
+                batch = self.bl_buffer.sample_success_balanced(
+                    self.cfg.rm_batch_size,
+                    getattr(self.cfg, "rm_success_positive_fraction", 0.5),
+                )
+            elif getattr(self.cfg, "rm_balanced_sampling", False):
                 batch = self.bl_buffer.sample_balanced(
                     self.cfg.rm_batch_size,
                     getattr(self.cfg, "rm_nonzero_fraction", 0.25),
@@ -130,14 +135,19 @@ class Trainer:
                 h_sp1=h_sp1 if self.cfg.rm_variant in {"sas", "sasz"} else None,
                 z=z if self.cfg.rm_variant == "sasz" else None,
             )
-            target = torch.tensor(r_list, device=self.device, dtype=torch.float32)
-            if self.cfg.rm_loss == "ce":
+            if self.cfg.rm_variant == "success":
+                success_list = [0.0 if item.success is None else float(item.success) for item in batch]
+                target = torch.tensor(success_list, device=self.device, dtype=torch.float32)
+                loss = F.binary_cross_entropy_with_logits(raw_pred.squeeze(-1), target)
+            else:
+                target = torch.tensor(r_list, device=self.device, dtype=torch.float32)
+            if self.cfg.rm_variant != "success" and self.cfg.rm_loss == "ce":
                 threshold = float(getattr(self.cfg, "rm_classification_threshold", 0.5))
                 cls = torch.ones_like(target, dtype=torch.long)
                 cls = torch.where(target > threshold, torch.full_like(cls, 2), cls)
                 cls = torch.where(target < -threshold, torch.zeros_like(cls), cls)
                 loss = F.cross_entropy(raw_pred, cls)
-            else:
+            elif self.cfg.rm_variant != "success":
                 pred = raw_pred.squeeze(-1)
                 if self.cfg.rm_loss == "huber":
                     loss = F.smooth_l1_loss(pred, target)

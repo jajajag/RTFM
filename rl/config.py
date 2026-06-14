@@ -55,7 +55,7 @@ class Config:
     xi_L: float = 1.0
 
     # Reward model
-    rm_variant: str = "sas"  # sa | sas | sasz
+    rm_variant: str = "sas"  # sa | sas | sasz | success
     rm_hidden: int = 256
     rm_lr: float = 3e-4
     rm_batch_size: int = 256
@@ -64,6 +64,7 @@ class Config:
     rm_loss: str = "mse"  # mse | huber | ce
     rm_balanced_sampling: bool = False
     rm_nonzero_fraction: float = 0.25
+    rm_success_positive_fraction: float = 0.5
     rm_classification_threshold: float = 0.5
 
     # Training / eval

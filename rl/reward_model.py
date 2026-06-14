@@ -18,7 +18,7 @@ class RewardModel(nn.Module):
         output_dim: int = 1,
     ):
         super().__init__()
-        assert rm_variant in {"sa", "sas", "sasz"}
+        assert rm_variant in {"sa", "sas", "sasz", "success"}
         self.rm_variant = rm_variant
         self.action_dim = int(action_dim)
         self.z_dim = int(z_dim or state_dim)
@@ -54,6 +54,8 @@ class RewardModel(nn.Module):
     def predict_reward(self, h_s: torch.Tensor, action_idx: torch.Tensor, h_sp1: Optional[torch.Tensor] = None, z: Optional[torch.Tensor] = None) -> torch.Tensor:
         a_onehot = F.one_hot(action_idx.long(), num_classes=self.action_dim).float()
         out = self.forward(h_s, a_onehot, h_sp1, z)
+        if self.rm_variant == "success":
+            return torch.sigmoid(out.squeeze(-1))
         if self.output_dim == 1:
             return out.squeeze(-1)
         probs = F.softmax(out, dim=-1)

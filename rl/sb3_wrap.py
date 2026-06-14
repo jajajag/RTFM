@@ -45,6 +45,7 @@ class HRLWrapper(gym.Env):
         self.seg_state_embs: List[torch.Tensor] = []
         self.pending_bl: List[Dict[str, Any]] = []
         self.pending_hl: List[HLSegment] = []
+        self.episode_bl: List[Dict[str, Any]] = []
         self.collect_experience = True
 
     def _to_device_obs(self, obs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
@@ -158,6 +159,7 @@ class HRLWrapper(gym.Env):
         self.seg_idx = 0
         self.step_in_seg = 0
         self.total_steps = 0
+        self.episode_bl = []
         self.current_raw_obs = clone_obs(obs)
         self._selector_step(self.current_raw_obs)
         wrapped = self._wrap_obs(self.current_raw_obs)
@@ -176,16 +178,18 @@ class HRLWrapper(gym.Env):
         self.seg_state_embs.append(self._state_embedding(next_obs).detach())
 
         if self.collect_experience:
-            self.pending_bl.append(
-                {
-                    "obs": clone_obs(prev_raw),
-                    "action": int(action),
-                    "reward": float(r_env),
-                    "next_obs": clone_obs(next_obs),
-                    "done": bool(done),
-                    "z": self.current_z.detach().cpu().clone(),
-                }
-            )
+            transition = {
+                "obs": clone_obs(prev_raw),
+                "action": int(action),
+                "reward": float(r_env),
+                "next_obs": clone_obs(next_obs),
+                "done": bool(done),
+                "z": self.current_z.detach().cpu().clone(),
+            }
+            if self.cfg.rm_variant == "success":
+                self.episode_bl.append(transition)
+            else:
+                self.pending_bl.append(transition)
 
         self.step_in_seg += 1
         self.total_steps += 1
@@ -200,6 +204,12 @@ class HRLWrapper(gym.Env):
         wrapped = self._wrap_obs(self.current_raw_obs)
         self.current_wrapped_obs = clone_obs(wrapped)
         info = dict(info)
+        if done and self.collect_experience and self.cfg.rm_variant == "success":
+            success = float(info.get("success", info.get("win", r_env > 0)))
+            for transition in self.episode_bl:
+                transition["success"] = success
+                self.pending_bl.append(transition)
+            self.episode_bl = []
         info.update(
             {
                 "r_env": float(r_env),

@@ -28,6 +28,7 @@ class BLTransition:
     next_obs: RawObs
     done: bool
     z: torch.Tensor
+    success: float | None = None
 
 
 class BLBuffer:
@@ -35,7 +36,7 @@ class BLBuffer:
         self.capacity = int(capacity)
         self.data: List[BLTransition] = []
 
-    def add(self, obs: RawObs, action: int, reward: float, next_obs: RawObs, done: bool, z: torch.Tensor) -> None:
+    def add(self, obs: RawObs, action: int, reward: float, next_obs: RawObs, done: bool, z: torch.Tensor, success: float | None = None) -> None:
         if len(self.data) >= self.capacity:
             self.data.pop(0)
         self.data.append(
@@ -46,6 +47,7 @@ class BLBuffer:
                 next_obs=_clone_obs_to_cpu(next_obs),
                 done=bool(done),
                 z=z.detach().cpu().clone(),
+                success=None if success is None else float(success),
             )
         )
 
@@ -70,6 +72,26 @@ class BLBuffer:
             n_nonzero = batch_size - n_zero
 
         batch = random.sample(nonzero, n_nonzero) + random.sample(zero, n_zero)
+        random.shuffle(batch)
+        return batch
+
+    def sample_success_balanced(self, batch_size: int, positive_fraction: float = 0.5) -> Optional[List[BLTransition]]:
+        labeled = [x for x in self.data if x.success is not None]
+        if len(labeled) < batch_size:
+            return None
+
+        positive = [x for x in labeled if float(x.success) > 0.5]
+        negative = [x for x in labeled if float(x.success) <= 0.5]
+        if not positive or not negative or positive_fraction <= 0:
+            return random.sample(labeled, batch_size)
+
+        n_positive = min(len(positive), int(round(batch_size * float(positive_fraction))))
+        n_negative = batch_size - n_positive
+        if n_negative > len(negative):
+            n_negative = len(negative)
+            n_positive = batch_size - n_negative
+
+        batch = random.sample(positive, n_positive) + random.sample(negative, n_negative)
         random.shuffle(batch)
         return batch
 
