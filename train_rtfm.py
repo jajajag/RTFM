@@ -94,12 +94,12 @@ def parse_args():
     ap.add_argument("--hl-aux-lambda", type=float, default=0.1)
 
     ap.add_argument("--ll-algo", choices=["ppo"], default="ppo")
-    ap.add_argument("--ll-reward", choices=["env", "rm", "mix"], default="mix")
+    ap.add_argument("--ll-reward", choices=["env", "rm", "mix"], default="env")
     ap.add_argument("--ll-lambda", type=float, default=0.1)
     ap.add_argument("--ll-update-every-steps", type=int, default=1024)
 
     ap.add_argument("--xi-h", type=float, default=1.0)
-    ap.add_argument("--xi-l", type=float, default=1.0)
+    ap.add_argument("--xi-l", type=float, default=0.1)
 
     ap.add_argument("--rm-variant", choices=["sa", "sas", "sasz", "success"], default="sas")
     ap.add_argument("--rm-loss", choices=["mse", "huber", "ce"], default="mse")
@@ -118,7 +118,7 @@ def parse_args():
 
     ap.add_argument("--total-steps", type=int, default=1000000)
     ap.add_argument("--eval-every-steps", type=int, default=5000)
-    ap.add_argument("--eval-episodes", type=int, default=20)
+    ap.add_argument("--eval-episodes", type=int, default=100)
 
     return ap.parse_args()
 
