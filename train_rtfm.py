@@ -88,7 +88,7 @@ def parse_args():
 
     ap.add_argument("--hl-T", type=int, default=10)
     ap.add_argument("--hl-gamma", type=float, default=0.99)
-    ap.add_argument("--hl-update-every-steps", type=int, default=1000)
+    ap.add_argument("--hl-update-every-steps", type=int, default=2000)
     ap.add_argument("--hl-return-source", choices=["rm", "env"], default="rm")
     ap.add_argument("--hl-aux-type", choices=["none", "cos", "v_diff"], default="cos")
     ap.add_argument("--hl-aux-lambda", type=float, default=0.01)
