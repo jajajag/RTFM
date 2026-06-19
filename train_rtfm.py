@@ -304,16 +304,26 @@ def main():
     )
 
     steps_done = 0
+    success_history = []
     while steps_done < cfg.total_steps:
         chunk = min(cfg.eval_every_steps, cfg.total_steps - steps_done)
         trainer.train(chunk)
         steps_done += chunk
 
         metrics = evaluate(ll_model, hrl_env, n_episodes=cfg.eval_episodes)
+        success_rate = float(metrics.get("success_rate", 0.0))
+        success_history.append(success_rate)
+        best_success_rates = sorted(success_history, reverse=True)[:10]
+        mean_success = float(np.mean(success_history))
+        top10_mean_success = float(np.mean(best_success_rates))
+        best_success_rate = float(best_success_rates[0])
         print(
             f"[steps={steps_done}] "
             f"return={metrics.get('return_mean', 0.0):.3f} "
-            f"success={metrics.get('success_rate', 0.0):.3f}",
+            f"success={success_rate:.3f} "
+            f"mean_success={mean_success:.3f} "
+            f"top10_mean_success={top10_mean_success:.3f} "
+            f"best_success={best_success_rate:.3f}",
             flush=True,
         )
         ll_model.save(f"checkpoints/ll_model_{steps_done}.zip")
