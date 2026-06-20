@@ -118,7 +118,7 @@ def parse_args():
 
     ap.add_argument("--total-steps", type=int, default=1000000)
     ap.add_argument("--eval-every-steps", type=int, default=5000)
-    ap.add_argument("--eval-episodes", type=int, default=100)
+    ap.add_argument("--eval-episodes", type=int, default=20)
 
     return ap.parse_args()
 
